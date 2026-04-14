@@ -1,0 +1,24 @@
+# ==========================================
+# DEPENDÊNCIAS DO SIMET V2 (ARQUITETURA API)
+# ==========================================
+
+# 1. Automação e Scraping
+playwright==1.42.0
+playwright-stealth
+
+# 2. Banco de Dados
+psycopg2-binary==2.9.9
+
+# 3. Inteligência Artificial
+openai
+instructor
+pydantic>=2.6.4
+
+# 4. Servidor API e Backend
+fastapi
+uvicorn
+pandas
+
+# 5. Utilidades
+python-dotenv==1.0.1
+psutil

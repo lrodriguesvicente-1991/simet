@@ -1,0 +1,15 @@
+# Ignora o ambiente virtual Python
+.venv/
+venv/
+env/
+
+# Ignora arquivos compilados do Python
+__pycache__/
+*.pyc
+
+# Ignora o arquivo de variáveis de ambiente (onde ficam senhas)
+.env
+
+# Ignora os pacotes gigantes do React (O PULO DO GATO)
+node_modules/
+frontend_react/node_modules/
