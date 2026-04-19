@@ -4,7 +4,6 @@
 # =====================================================================
 
 import os
-import json
 import re
 import random
 import time
@@ -12,6 +11,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
 from database.connection import obter_conexao
+from database.engine import obter_tarefas_ativas, salvar_na_fila
 
 try:
     from playwright_stealth import stealth_sync
@@ -21,39 +21,14 @@ except ImportError:
 
 load_dotenv()
 
-def obter_tarefas_ativas():
-    conn = obter_conexao()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT c.cfg_id, u.unf_sigla, c.cfg_fonte_nome, c.cfg_url_busca, c.cfg_paginas_max 
-        FROM public.smt_config_unf_scraping c
-        JOIN public.smt_unidade_federativa u ON c.cfg_unf_id = u.unf_id
-        WHERE c.cfg_ativo = true;
-    """)
-    tarefas = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return tarefas
-
-def salvar_na_fila(conn, fonte, url, dados_json):
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO public.smt_fila_processamento (fil_fonte, fil_url, fil_conteudo_jsonb, fil_status)
-        VALUES (%s, %s, %s, 'PENDENTE') ON CONFLICT (fil_url) DO NOTHING;
-    """, (fonte, url, json.dumps(dados_json, ensure_ascii=False)))
-    inserido = cursor.rowcount > 0
-    conn.commit()
-    cursor.close()
-    return inserido
-
 def extrair_olx(page):
     conteudo_html = page.content()
     if "Ops! Nenhum anuncio foi encontrado" in conteudo_html or "Ops! Nenhum resultado" in conteudo_html:
         return [] 
         
-    try: 
+    try:
         page.wait_for_selector('a[data-testid="ad-card-link"], a[data-ds-component="DS-NewAdCard-Link"]', timeout=10000)
-    except: 
+    except Exception:
         pass
     
     ads = []
@@ -71,16 +46,16 @@ def extrair_olx(page):
                 texto = link.inner_text().strip()
                 titulo = texto.split('\n')[0] if texto else "Anuncio OLX"
                 ads.append({"titulo": titulo, "url": url_limpa, "raw": []})
-        except: 
+        except Exception:
             continue
-            
+
     return list({ad['url']: ad for ad in ads}.values())
 
 def extrair_mfrural(page):
-    try: 
+    try:
         page.wait_for_selector("a[href*='/detalhe/']", timeout=15000)
-    except: 
-        pass 
+    except Exception:
+        pass
         
     ads = []
     for link in page.locator("a").all():
@@ -93,12 +68,14 @@ def extrair_mfrural(page):
                 texto = link.inner_text().strip()
                 if texto: 
                     ads.append({"titulo": texto.split('\n')[0], "url": url, "raw": texto.split('\n')})
-        except: 
+        except Exception:
             continue
-            
+
     return list({ad['url']: ad for ad in ads}.values())
 
-def executar_lfp(tarefas, evento_fim=None):
+def executar_lfp(tarefas=None, evento_fim=None):
+    if not tarefas: 
+        tarefas = obter_tarefas_ativas()
     if not tarefas: 
         return
     
@@ -122,6 +99,8 @@ def executar_lfp(tarefas, evento_fim=None):
         if aplicar_stealth: aplicar_stealth(page)
         
         for t in tarefas:
+            if evento_fim and evento_fim.is_set(): break
+            
             cfg_id, sigla, fonte, url_busca, p_max = t
             pag = 1
             erros_consecutivos = 0
@@ -129,13 +108,13 @@ def executar_lfp(tarefas, evento_fim=None):
             links_da_pagina_anterior = set() 
             
             while True:
+                if evento_fim and evento_fim.is_set(): break
                 if p_max > 0 and pag > p_max: break
                 if erros_consecutivos >= 5: 
                     print(f"[LFP] Limite de exceções excedido em {sigla}. Abortando.", flush=True)
                     break
                 
-                limite_str = str(p_max) if p_max > 0 else "∞"
-                # A String abaixo manteve a estrutura de pipes "|" para o Frontend poder quebrar e ler sem os emojis.
+                limite_str = str(p_max) if p_max > 0 else "sem limite"
                 print(f"[LFP] Varredura iniciada no estado {sigla} | Plataforma: {fonte} | Pág: {pag}/{limite_str}", flush=True)
                 
                 url_p = url_busca if pag == 1 else (f"{url_busca}{'&' if '?' in url_busca else '?'}o={pag}" if fonte.upper() == 'OLX' else f"{url_busca}?pg={pag}")
@@ -177,6 +156,8 @@ def executar_lfp(tarefas, evento_fim=None):
                     
                     links_da_pagina_anterior = links_da_pagina_atual
                     time.sleep(random.uniform(2, 5))
+                    delay_extra = float(os.getenv("SIMET_DELAY_EXTRA_S", "0") or 0)
+                    if delay_extra > 0: time.sleep(delay_extra)
                     pag += 1
                     
                 except Exception as e:
@@ -191,5 +172,4 @@ def executar_lfp(tarefas, evento_fim=None):
     if evento_fim: evento_fim.set()
 
 if __name__ == "__main__":
-    tarefas = obter_tarefas_ativas()
-    executar_lfp(tarefas)
+    executar_lfp()

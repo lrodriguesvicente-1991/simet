@@ -1,0 +1,39 @@
+# =====================================================================
+# docker-compose.yml - SIMET V2 (produção)
+# Banco de dados: Supabase (externo). Não subimos Postgres local.
+# =====================================================================
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: simet_api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SIMET_HEADLESS: "1"
+      PYTHONUNBUFFERED: "1"
+    expose:
+      - "8000"
+    # Playwright/Chromium precisa de shared memory maior
+    shm_size: "1gb"
+    networks:
+      - simet_net
+
+  frontend:
+    build:
+      context: ./frontend_react
+      dockerfile: Dockerfile
+    container_name: simet_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    networks:
+      - simet_net
+
+networks:
+  simet_net:
+    driver: bridge

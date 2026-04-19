@@ -13,3 +13,11 @@ __pycache__/
 # Ignora os pacotes gigantes do React (O PULO DO GATO)
 node_modules/
 frontend_react/node_modules/
+
+# Ignora build de produção do front
+frontend_react/dist/
+
+# Ferramentas/configs locais
+.claude/
+.vscode/
+.idea/

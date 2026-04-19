@@ -3,11 +3,11 @@
 # ==========================================
 
 # 1. Automação e Scraping
-playwright==1.42.0
+playwright
 playwright-stealth
 
 # 2. Banco de Dados
-psycopg2-binary==2.9.9
+psycopg2-binary
 
 # 3. Inteligência Artificial
 openai
@@ -18,6 +18,8 @@ pydantic>=2.6.4
 fastapi
 uvicorn
 pandas
+PyJWT
+requests
 
 # 5. Utilidades
 python-dotenv==1.0.1
