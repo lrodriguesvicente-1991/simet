@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { Navigate, useNavigate } from 'react-router-dom';
-import { Eye, EyeOff, Lock, Loader2, MapPin, User } from 'lucide-react';
+import { Eye, EyeOff, Lock, Loader2, User } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 
 export default function Login() {
@@ -35,10 +35,8 @@ export default function Login() {
     <div className="flex min-h-screen bg-background items-center justify-center p-4">
       <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-border p-8">
         <div className="flex flex-col items-center mb-8">
-          <div className="w-16 h-16 bg-primary rounded-xl flex items-center justify-center text-white mb-4 shadow-md">
-            <MapPin size={32} />
-          </div>
-          <h1 className="text-2xl font-bold text-foreground">SIMET — INCRA</h1>
+          <img src="/favicon.png" alt="INCRA" className="h-20 mb-3 object-contain" />
+          <h1 className="text-2xl font-bold text-foreground">SIMET</h1>
           <p className="text-muted-foreground text-sm text-center mt-1">
             Plataforma Analítica de Valores Fundiários
           </p>

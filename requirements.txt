@@ -24,3 +24,10 @@ requests
 # 5. Utilidades
 python-dotenv==1.0.1
 psutil
+
+# 6. Exportacao de relatorios
+openpyxl
+reportlab
+
+# 7. Hash de senhas
+bcrypt

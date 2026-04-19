@@ -1,4 +1,3 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertOctagon,
   AlertTriangle,
@@ -24,9 +23,15 @@ import {
   Sparkles,
   Zap,
 } from 'lucide-react';
-import { api } from '@/lib/api';
-
-type Operacao = 'full' | 'lfp' | 'eci' | 'aci' | 'test';
+import {
+  formatarValor,
+  useRobo,
+  type EventoFeed,
+  type LfpState,
+  type Operacao,
+  type StatusWorker,
+  type WorkerState,
+} from '@/contexts/RoboContext';
 
 interface OpcaoOperacao {
   id: Operacao;
@@ -89,22 +94,6 @@ function calcularRisco(delayExtra: number): { pct: number; label: string; cor: s
   if (pct >= 12) return { pct, label: 'Baixo', cor: 'text-emerald-600' };
   return { pct, label: 'Mínimo', cor: 'text-emerald-700' };
 }
-
-// =====================================================================
-// Modelagem do estado a partir dos logs
-// =====================================================================
-type StatusWorker =
-  | 'ocioso'
-  | 'capturando'
-  | 'extraindo'
-  | 'salvando'
-  | 'sucesso'
-  | 'descartado'
-  | 'linkMorto'
-  | 'bloqueado'
-  | 'fallback'
-  | 'erro'
-  | 'munAusente';
 
 interface DefStatus {
   label: string;
@@ -172,7 +161,7 @@ const STATUS: Record<StatusWorker, DefStatus> = {
     pulsa: false,
   },
   linkMorto: {
-    label: 'Link morto',
+    label: 'Anúncio removido',
     icone: Skull,
     cor: 'text-slate-500',
     bg: 'bg-slate-100',
@@ -199,7 +188,7 @@ const STATUS: Record<StatusWorker, DefStatus> = {
     pulsa: true,
   },
   erro: {
-    label: 'Erro crítico',
+    label: 'Falha ao processar',
     icone: AlertOctagon,
     cor: 'text-red-700',
     bg: 'bg-red-50',
@@ -218,443 +207,36 @@ const STATUS: Record<StatusWorker, DefStatus> = {
   },
 };
 
-interface WorkerState {
-  id: number;
-  status: StatusWorker;
-  modo: 'ia' | 'deterministico' | null;
-  anuncioId: string | null;
-  municipio: string | null;
-  uf: string | null;
-  areaHa: number | null;
-  valor: number | null;
-  confianca: number | null;
-  sucessos: number;
-  descartes: number;
-  linksMortos: number;
-  erros: number;
-  ultimoLogTs: number;
-  ultimaLinha: string;
-}
-
-interface LfpState {
-  ativo: boolean;
-  uf: string | null;
-  plataforma: string | null;
-  pagina: number;
-  paginasTotal: number | null;
-  amostrasUltima: number;
-  insercoesUltima: number;
-  totalInsercoes: number;
-  ultimoLogTs: number;
-  ultimaLinha: string;
-  finalizado: boolean;
-}
-
-interface EventoFeed {
-  id: string;
-  ts: number;
-  worker: number | null;
-  status: StatusWorker | 'lfp' | 'system';
-  mensagem: string;
-  detalhe?: string;
-}
-
-// Regex de parsing
-const RE_WORKER = /^Worker\s+(\d+):\s+(.*)$/;
-const RE_TAG = /^\[([^\]]+)\]\s*(.*)$/;
-const RE_SUCESSO = /ID\s+(\S+)\s+\|\s+([\d.]+)ha\s+\|\s+R\$([\d.]+)\s+\|\s+([^/]+)\/(\w+)\s+\|\s+.*conf:(\d+)/;
-const RE_ID_URL = /ID\s+(\S+)(?:\s+\|\s+(\S+))?/;
-const RE_ID_MUN = /ID\s+(\S+)\s+\|\s+([^/]+)\/(\w+)/;
-const RE_MODO = /modo=(IA|DETERMINISTICO)/i;
-const RE_LFP_VARRE = /^\[LFP\]\s+Varredura iniciada no estado\s+(\w+)\s+\|\s+Plataforma:\s+(\w+)\s+\|\s+Pág:\s+(\d+)\/(\S+)/;
-const RE_LFP_LEITURA = /^\[LFP\]\s+Leitura conclu[ií]da:\s+(\w+)\s+\(Pág\s+(\d+)\)\s+\|\s+Amostras:\s+(\d+)\s+\|\s+Inser[çc][ãa]o[ae]s:\s+(\d+)/;
-const RE_LFP_FIM_TOTAL = /^\[LFP\]\s+Opera[çc][ãa]o Finalizada\.\s+Total de novas inser[çc][õo]es:\s+(\d+)/;
-
-function interpretarTag(tag: string): StatusWorker | null {
-  const t = tag.toUpperCase().replace(/\s+/g, ' ').trim();
-  if (t === 'PROCESSANDO') return 'capturando';
-  if (t === 'EXTRAINDO') return 'extraindo';
-  if (t === 'SALVANDO') return 'salvando';
-  if (t === 'SUCESSO') return 'sucesso';
-  if (t === 'IMPLAUSIVEL' || t === 'CONFIANCA BAIXA' || t === 'VAZIO') return 'descartado';
-  if (t === 'LINK MORTO') return 'linkMorto';
-  if (t === 'BLOQUEIO') return 'bloqueado';
-  if (t === 'IA->FALLBACK' || t === 'IA FALHOU') return 'fallback';
-  if (t === 'ERRO CRITICO') return 'erro';
-  if (t === 'MUN NAO ENCONTRADO') return 'munAusente';
-  return null;
-}
-
-function formatarValor(v: number | null): string {
-  if (v === null || !isFinite(v)) return '—';
-  if (v >= 1_000_000) return `R$ ${(v / 1_000_000).toFixed(1).replace('.', ',')}M`;
-  if (v >= 1_000) return `R$ ${(v / 1_000).toFixed(0)}k`;
-  return `R$ ${v.toFixed(0)}`;
-}
-
 // =====================================================================
 // Componente principal
 // =====================================================================
 export default function Comando() {
-  const [rodando, setRodando] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
-  const [operacao, setOperacao] = useState<Operacao>('full');
-  const [workers, setWorkers] = useState(3);
-  const [modoVisual, setModoVisual] = useState(false);
-  const [delayExtra, setDelayExtra] = useState(3);
-  const [mostrarCru, setMostrarCru] = useState(false);
-
-  // Estados derivados + acumulados (via ref, sobrevivem a logs saindo do buffer)
-  const workersRef = useRef<Map<number, WorkerState>>(new Map());
-  const lfpRef = useRef<LfpState>({
-    ativo: false,
-    uf: null,
-    plataforma: null,
-    pagina: 0,
-    paginasTotal: null,
-    amostrasUltima: 0,
-    insercoesUltima: 0,
-    totalInsercoes: 0,
-    ultimoLogTs: 0,
-    ultimaLinha: '',
-    finalizado: false,
-  });
-  const feedRef = useRef<EventoFeed[]>([]);
-  const linhasVistas = useRef<Set<string>>(new Set());
-  const [tick, setTick] = useState(0);
-
-  // Polling
-  useEffect(() => {
-    const fetchStatus = async () => {
-      try {
-        const res = await api.get<{ rodando: boolean; logs_recentes: string[] }>('/robo/status');
-        setRodando(res.data.rodando);
-        setLogs(res.data.logs_recentes || []);
-      } catch {
-        /* ignora erros transitórios do polling */
-      }
-    };
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 2000);
-    return () => clearInterval(interval);
-  }, []);
-
-  // Reset quando robô para de rodar e depois reinicia
-  const prevRodando = useRef(false);
-  useEffect(() => {
-    if (rodando && !prevRodando.current) {
-      workersRef.current = new Map();
-      lfpRef.current = {
-        ativo: false,
-        uf: null,
-        plataforma: null,
-        pagina: 0,
-        paginasTotal: null,
-        amostrasUltima: 0,
-        insercoesUltima: 0,
-        totalInsercoes: 0,
-        ultimoLogTs: 0,
-        ultimaLinha: '',
-        finalizado: false,
-      };
-      feedRef.current = [];
-      linhasVistas.current = new Set();
-    }
-    prevRodando.current = rodando;
-  }, [rodando]);
-
-  // Parseia logs novos
-  useEffect(() => {
-    const agora = Date.now();
-    let mudou = false;
-
-    for (const linha of logs) {
-      if (linhasVistas.current.has(linha)) continue;
-      linhasVistas.current.add(linha);
-      mudou = true;
-
-      // LFP
-      const mVarre = linha.match(RE_LFP_VARRE);
-      if (mVarre) {
-        const paginasTotal = mVarre[4] === 'sem limite' ? null : parseInt(mVarre[4], 10);
-        lfpRef.current = {
-          ...lfpRef.current,
-          ativo: true,
-          uf: mVarre[1],
-          plataforma: mVarre[2],
-          pagina: parseInt(mVarre[3], 10),
-          paginasTotal,
-          ultimoLogTs: agora,
-          ultimaLinha: linha,
-          finalizado: false,
-        };
-        feedRef.current.unshift({
-          id: `${agora}-${Math.random()}`,
-          ts: agora,
-          worker: null,
-          status: 'lfp',
-          mensagem: `Varrendo ${mVarre[1]} · ${mVarre[2]} · Página ${mVarre[3]}/${mVarre[4]}`,
-        });
-        continue;
-      }
-
-      const mLeitura = linha.match(RE_LFP_LEITURA);
-      if (mLeitura) {
-        const inseridos = parseInt(mLeitura[4], 10);
-        const amostras = parseInt(mLeitura[3], 10);
-        lfpRef.current = {
-          ...lfpRef.current,
-          ativo: true,
-          amostrasUltima: amostras,
-          insercoesUltima: inseridos,
-          totalInsercoes: lfpRef.current.totalInsercoes + inseridos,
-          ultimoLogTs: agora,
-          ultimaLinha: linha,
-        };
-        feedRef.current.unshift({
-          id: `${agora}-${Math.random()}`,
-          ts: agora,
-          worker: null,
-          status: 'lfp',
-          mensagem: `${mLeitura[1]} pág ${mLeitura[2]} · ${amostras} anúncios · ${inseridos} novos`,
-        });
-        continue;
-      }
-
-      const mFim = linha.match(RE_LFP_FIM_TOTAL);
-      if (mFim) {
-        lfpRef.current = {
-          ...lfpRef.current,
-          ativo: false,
-          finalizado: true,
-          totalInsercoes: parseInt(mFim[1], 10),
-          ultimoLogTs: agora,
-          ultimaLinha: linha,
-        };
-        feedRef.current.unshift({
-          id: `${agora}-${Math.random()}`,
-          ts: agora,
-          worker: null,
-          status: 'lfp',
-          mensagem: `Mapeamento concluído · ${mFim[1]} novos anúncios na fila`,
-        });
-        continue;
-      }
-
-      if (linha.startsWith('[LFP]')) {
-        lfpRef.current = { ...lfpRef.current, ultimoLogTs: agora, ultimaLinha: linha };
-        continue;
-      }
-
-      // Worker
-      const mW = linha.match(RE_WORKER);
-      if (!mW) continue;
-
-      const wid = parseInt(mW[1], 10);
-      const resto = mW[2];
-      let estado = workersRef.current.get(wid);
-      if (!estado) {
-        estado = {
-          id: wid,
-          status: 'ocioso',
-          modo: null,
-          anuncioId: null,
-          municipio: null,
-          uf: null,
-          areaHa: null,
-          valor: null,
-          confianca: null,
-          sucessos: 0,
-          descartes: 0,
-          linksMortos: 0,
-          erros: 0,
-          ultimoLogTs: 0,
-          ultimaLinha: '',
-        };
-      }
-
-      // Log de setup: "Worker 1: modo=IA ..." ou "Worker 1: modo=DETERMINISTICO ..."
-      const mModo = resto.match(RE_MODO);
-      if (mModo) {
-        estado = {
-          ...estado,
-          modo: mModo[1].toUpperCase() === 'IA' ? 'ia' : 'deterministico',
-          ultimoLogTs: agora,
-          ultimaLinha: linha,
-        };
-        workersRef.current.set(wid, estado);
-        continue;
-      }
-
-      const mTag = resto.match(RE_TAG);
-      if (!mTag) {
-        estado = { ...estado, ultimoLogTs: agora, ultimaLinha: linha };
-        workersRef.current.set(wid, estado);
-        continue;
-      }
-
-      const tag = mTag[1];
-      const body = mTag[2];
-      const statusNovo = interpretarTag(tag);
-
-      if (statusNovo) {
-        let patch: Partial<WorkerState> = {
-          status: statusNovo,
-          ultimoLogTs: agora,
-          ultimaLinha: linha,
-        };
-
-        if (statusNovo === 'capturando' || statusNovo === 'extraindo') {
-          const mId = body.match(RE_ID_URL);
-          if (mId) patch.anuncioId = mId[1];
-          if (statusNovo === 'capturando') {
-            // Reset de dados do anúncio anterior
-            patch.municipio = null;
-            patch.uf = null;
-            patch.areaHa = null;
-            patch.valor = null;
-            patch.confianca = null;
-          }
-        } else if (statusNovo === 'salvando') {
-          const mIdMun = body.match(RE_ID_MUN);
-          if (mIdMun) {
-            patch.anuncioId = mIdMun[1];
-            patch.municipio = mIdMun[2].trim();
-            patch.uf = mIdMun[3];
-          }
-        } else if (statusNovo === 'sucesso') {
-          const mS = body.match(RE_SUCESSO);
-          if (mS) {
-            patch.anuncioId = mS[1];
-            patch.areaHa = parseFloat(mS[2]);
-            patch.valor = parseFloat(mS[3]);
-            patch.municipio = mS[4].trim();
-            patch.uf = mS[5];
-            patch.confianca = parseInt(mS[6], 10);
-          }
-          patch.sucessos = estado.sucessos + 1;
-        } else if (statusNovo === 'descartado' || statusNovo === 'munAusente') {
-          patch.descartes = estado.descartes + 1;
-        } else if (statusNovo === 'linkMorto') {
-          patch.linksMortos = estado.linksMortos + 1;
-        } else if (statusNovo === 'erro') {
-          patch.erros = estado.erros + 1;
-        }
-
-        estado = { ...estado, ...patch };
-
-        // Feed
-        const evento: EventoFeed = {
-          id: `${agora}-${wid}-${Math.random()}`,
-          ts: agora,
-          worker: wid,
-          status: statusNovo,
-          mensagem:
-            statusNovo === 'sucesso' && estado.municipio
-              ? `Salvou ${estado.municipio}/${estado.uf ?? ''} · ${estado.areaHa ?? '—'} ha · ${formatarValor(
-                  estado.valor,
-                )} · conf ${estado.confianca ?? '—'}`
-              : statusNovo === 'capturando' && estado.anuncioId
-              ? `Capturando anúncio ${estado.anuncioId}`
-              : statusNovo === 'extraindo' && estado.anuncioId
-              ? `Extraindo ${estado.anuncioId}`
-              : statusNovo === 'salvando' && estado.municipio
-              ? `Salvando em ${estado.municipio}/${estado.uf ?? ''}`
-              : `${STATUS[statusNovo].label}${estado.anuncioId ? ` · ${estado.anuncioId}` : ''}`,
-          detalhe: body.length > 80 ? body.slice(0, 80) + '…' : undefined,
-        };
-
-        // Só adiciona ao feed status que "contam" (evita ruído de subtag)
-        if (
-          ['capturando', 'sucesso', 'descartado', 'linkMorto', 'bloqueado', 'erro', 'fallback', 'munAusente'].includes(
-            statusNovo,
-          )
-        ) {
-          feedRef.current.unshift(evento);
-        }
-      } else {
-        // Tag intermediária: [CORRECAO AREA], [AREA REGEX], [MUN VIA SLUG], [INFO], etc.
-        estado = { ...estado, ultimoLogTs: agora, ultimaLinha: linha };
-      }
-
-      workersRef.current.set(wid, estado);
-    }
-
-    // Limita feed a 200 eventos
-    if (feedRef.current.length > 200) feedRef.current = feedRef.current.slice(0, 200);
-
-    if (mudou) setTick((t) => t + 1);
-  }, [logs]);
-
-  // Tick periódico para decair workers ativos para "ocioso" após inatividade
-  useEffect(() => {
-    const iv = setInterval(() => {
-      const agora = Date.now();
-      let mudou = false;
-      for (const [id, w] of workersRef.current) {
-        const idade = agora - w.ultimoLogTs;
-        // Status terminais (sucesso/descartado/etc) voltam pra ocioso após 3s
-        const terminais: StatusWorker[] = ['sucesso', 'descartado', 'linkMorto', 'munAusente', 'erro'];
-        if (terminais.includes(w.status) && idade > 3000) {
-          workersRef.current.set(id, { ...w, status: 'ocioso' });
-          mudou = true;
-        }
-        // Ativos sem log novo há > 15s também viram ociosos (evita card travado)
-        const ativos: StatusWorker[] = ['capturando', 'extraindo', 'salvando', 'fallback'];
-        if (ativos.includes(w.status) && idade > 15000) {
-          workersRef.current.set(id, { ...w, status: 'ocioso' });
-          mudou = true;
-        }
-      }
-      if (mudou) setTick((t) => t + 1);
-    }, 1000);
-    return () => clearInterval(iv);
-  }, []);
-
-  const handleIniciar = async () => {
-    try {
-      await api.post('/robo/iniciar', {
-        task: operacao,
-        workers,
-        headless: !modoVisual,
-        delay_extra: delayExtra,
-      });
-    } catch (e) {
-      console.error('Erro ao iniciar robô', e);
-    }
-  };
-
-  const handleParar = async () => {
-    try {
-      await api.post('/robo/parar');
-    } catch (e) {
-      console.error('Erro ao parar robô', e);
-    }
-  };
+  const {
+    rodando,
+    circuitBreaker,
+    circuitBreakerMsg,
+    logs,
+    workersList,
+    lfpState,
+    eventos,
+    totais,
+    operacao,
+    setOperacao,
+    workers,
+    setWorkers,
+    modoVisual,
+    setModoVisual,
+    delayExtra,
+    setDelayExtra,
+    mostrarCru,
+    setMostrarCru,
+    iniciar,
+    parar,
+    reconhecerAlarme,
+  } = useRobo();
 
   const opAtual = OPERACOES.find((o) => o.id === operacao)!;
   const risco = calcularRisco(delayExtra);
-
-  const workersList = useMemo(() => {
-    const arr = Array.from(workersRef.current.values());
-    arr.sort((a, b) => a.id - b.id);
-    return arr;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick]);
-
-  const totais = useMemo(() => {
-    return workersList.reduce(
-      (acc, w) => ({
-        sucessos: acc.sucessos + w.sucessos,
-        descartes: acc.descartes + w.descartes,
-        linksMortos: acc.linksMortos + w.linksMortos,
-        erros: acc.erros + w.erros,
-      }),
-      { sucessos: 0, descartes: 0, linksMortos: 0, erros: 0 },
-    );
-  }, [workersList]);
-
-  const eventos = feedRef.current;
   const mostrarLFP = operacao === 'full' || operacao === 'lfp';
   const mostrarWorkers = operacao === 'full' || operacao === 'eci';
 
@@ -668,6 +250,31 @@ export default function Comando() {
       </header>
 
       <div className="flex-1 overflow-auto p-8 space-y-6">
+        {circuitBreaker && (
+          <div className="bg-red-600 text-white rounded-xl shadow-lg border border-red-800 p-5 flex items-start gap-4 animate-pulse">
+            <AlertOctagon size={36} className="shrink-0 mt-0.5" />
+            <div className="flex-1">
+              <div className="font-bold text-lg">Alarme do extrator disparado</div>
+              <p className="text-sm mt-1 text-red-50">
+                O sistema processou muitos anúncios seguidos sem conseguir salvar nenhum. O robô foi
+                parado automaticamente para evitar queima de IP. Investigue antes de reiniciar —
+                provável mudança no layout da OLX ou bloqueio em andamento.
+              </p>
+              {circuitBreakerMsg && (
+                <div className="mt-2 text-[11px] font-mono bg-red-900/40 px-2 py-1 rounded">
+                  {circuitBreakerMsg}
+                </div>
+              )}
+            </div>
+            <button
+              onClick={reconhecerAlarme}
+              className="bg-white text-red-700 font-bold px-4 py-2 rounded-md shadow hover:bg-red-50 transition shrink-0"
+            >
+              Reconhecer
+            </button>
+          </div>
+        )}
+
         {/* ==== Passo 1: escolher operação ==== */}
         <section>
           <div className="flex items-center gap-2 mb-3">
@@ -832,14 +439,14 @@ export default function Comando() {
             </div>
             {!rodando ? (
               <button
-                onClick={handleIniciar}
+                onClick={iniciar}
                 className="bg-primary hover:bg-primary/90 text-white font-bold py-3 px-6 rounded-lg shadow flex justify-center items-center gap-2 transition min-w-[200px]"
               >
                 <Cpu size={18} /> Iniciar operação
               </button>
             ) : (
               <button
-                onClick={handleParar}
+                onClick={parar}
                 className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg shadow flex justify-center items-center gap-2 transition min-w-[200px]"
               >
                 <AlertTriangle size={18} /> Parar operação
@@ -882,7 +489,7 @@ export default function Comando() {
           </div>
 
           {/* LFP */}
-          {mostrarLFP && <CardLFP estado={lfpRef.current} rodando={rodando} />}
+          {mostrarLFP && <CardLFP estado={lfpState} rodando={rodando} />}
 
           {/* Grid de workers */}
           {mostrarWorkers && (
@@ -1050,18 +657,41 @@ function CardLFP({ estado, rodando }: { estado: LfpState; rodando: boolean }) {
       ? Math.min(100, Math.round((estado.pagina / estado.paginasTotal) * 100))
       : null;
 
+  const iconeWrapCls = estado.finalizado
+    ? 'bg-emerald-50 text-emerald-600'
+    : ativo
+    ? 'bg-sky-50 text-sky-600'
+    : 'bg-slate-100 text-slate-400';
+
+  const cardCls = estado.finalizado
+    ? 'bg-white border border-emerald-300 ring-1 ring-emerald-200 rounded-xl p-4 shadow-sm'
+    : 'bg-white border border-border rounded-xl p-4 shadow-sm';
+
   return (
-    <div className="bg-white border border-border rounded-xl p-4 shadow-sm">
+    <div className={cardCls}>
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <div className={`p-2 rounded-lg ${ativo ? 'bg-sky-50 text-sky-600' : 'bg-slate-100 text-slate-400'}`}>
-            {ativo ? <Radar size={18} className="animate-pulse" /> : <Radar size={18} />}
+          <div className={`p-2 rounded-lg ${iconeWrapCls}`}>
+            {estado.finalizado ? (
+              <CheckCircle2 size={18} />
+            ) : ativo ? (
+              <Radar size={18} className="animate-pulse" />
+            ) : (
+              <Radar size={18} />
+            )}
           </div>
           <div>
-            <div className="font-bold text-sm">Mapeador de anúncios</div>
-            <div className="text-[11px] text-muted-foreground">
+            <div className="font-bold text-sm flex items-center gap-2">
+              Mapeador de anúncios
+              {estado.finalizado && (
+                <span className="text-[10px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded">
+                  Concluído
+                </span>
+              )}
+            </div>
+            <div className={`text-[11px] ${estado.finalizado ? 'text-emerald-700 font-semibold' : 'text-muted-foreground'}`}>
               {estado.finalizado
-                ? 'Varredura concluída'
+                ? `Varredura concluída · ${estado.totalInsercoes} novos na fila`
                 : ativo
                 ? `Varrendo ${estado.uf ?? '—'} · ${estado.plataforma ?? '—'}`
                 : rodando

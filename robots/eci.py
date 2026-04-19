@@ -367,6 +367,8 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
 
     modo_headless = os.getenv("SIMET_HEADLESS", "0") == "1"
     delay_extra = float(os.getenv("SIMET_DELAY_EXTRA_S", "0") or 0)
+    limite_cb = int(os.getenv("SIMET_CB_MAX_FALHAS", "100") or 100)
+    falhas_consecutivas = 0
     processados = 0
     esperando_log = False
 
@@ -393,6 +395,7 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
 
             esperando_log = False
             fil_id, fonte, url = tarefa
+            salvou_neste_ciclo = False
             print(f"\n{'-'*60}")
             print(f"Worker {worker_id}: [PROCESSANDO] ID {fil_id} | {url}", flush=True)
 
@@ -605,6 +608,7 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                             'data_publicacao_texto': data_pub_texto,
                             'data_publicacao': data_pub_dt,
                         })
+                        salvou_neste_ciclo = True
                         # Tipologia: une IA + classificador de termos
                         tip_termos = classificar_tipologias(conn_s, f"{titulo_pag} {texto_pag}")
                         tip_final = list({*tip_termos, *tipologias})
@@ -635,8 +639,20 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                     try: context.close()
                     except Exception: pass
                 processados += 1
+                if salvou_neste_ciclo:
+                    falhas_consecutivas = 0
+                else:
+                    falhas_consecutivas += 1
                 if delay_extra > 0:
                     time.sleep(delay_extra)
+
+            if falhas_consecutivas >= limite_cb:
+                print(
+                    f"Worker {worker_id}: [CIRCUIT_BREAKER] {falhas_consecutivas} ciclos "
+                    f"sem salvar anuncio. Parando robo. Avise o administrador.",
+                    flush=True,
+                )
+                break
 
         browser.close()
 

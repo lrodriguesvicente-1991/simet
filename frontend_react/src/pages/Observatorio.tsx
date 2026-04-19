@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   MapContainer,
   TileLayer,
@@ -10,7 +10,7 @@ import {
 import L from 'leaflet';
 import type { Geometry } from 'geojson';
 import 'leaflet/dist/leaflet.css';
-import { AlertTriangle, BarChart3, MapPin, RefreshCw, TrendingUp } from 'lucide-react';
+import { AlertTriangle, BarChart3, ChevronDown, FileSpreadsheet, FileText, MapPin, RefreshCw, TrendingUp } from 'lucide-react';
 import { api } from '@/lib/api';
 
 interface FazendaData {
@@ -29,10 +29,19 @@ interface FazendaData {
   n_floresta_plantada: number;
   n_floresta_nativa: number;
   media_geral: number;
+  media_agricola: number | null;
+  media_pecuaria: number | null;
+  media_floresta_plantada: number | null;
+  media_floresta_nativa: number | null;
   coef_dispersao_pct: number;
+  mercado_regional_codigo: string | null;
+  mercado_regional_nome: string | null;
   lat: number;
   lon: number;
 }
+
+type Metrica = 'mediana' | 'media';
+
 
 const formatBRL = (val: number | null | undefined) =>
   val == null
@@ -42,10 +51,79 @@ const formatBRL = (val: number | null | undefined) =>
 const inputClass =
   'w-full border border-border rounded-md px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-primary';
 
+
 // Ordena categorias de tamanho do maior pro menor.
 // Usa número extraido do nome (ex: "50+ ha", "20-50 ha") e fallback por nome INCRA.
+// Agrega linhas do mesmo municipio (selecionadas em varios tamanhos) em uma
+// unica linha. Usa media ponderada pelo numero de amostras:
+//  - exato para "Media" (operacao linear)
+//  - aproximado para "Mediana" (nao recalcula mediana real, usa peso amostral)
+function agregarPorMunicipio(linhas: FazendaData[]): FazendaData[] {
+  const grupos = new Map<string, FazendaData[]>();
+  for (const l of linhas) {
+    const k = `${l.estado}|${l.municipio}`;
+    const g = grupos.get(k);
+    if (g) g.push(l);
+    else grupos.set(k, [l]);
+  }
+
+  const ponderada = (
+    grupo: FazendaData[],
+    getValor: (d: FazendaData) => number | null,
+    getPeso: (d: FazendaData) => number,
+  ): number | null => {
+    let soma = 0;
+    let pesos = 0;
+    for (const d of grupo) {
+      const v = getValor(d);
+      const p = getPeso(d);
+      if (v != null && isFinite(v) && p > 0) {
+        soma += v * p;
+        pesos += p;
+      }
+    }
+    return pesos > 0 ? soma / pesos : null;
+  };
+
+  return Array.from(grupos.values()).map((grupo) => {
+    const head = grupo[0];
+    const pesoTotal = (d: FazendaData) => d.total_anuncios_reais;
+    const total = grupo.reduce((a, b) => a + b.total_anuncios_reais, 0);
+    return {
+      ...head,
+      total_anuncios_reais: total,
+      categoria_tamanho:
+        grupo.length === 1 ? head.categoria_tamanho : `${grupo.length} tamanhos`,
+      mediana_geral: ponderada(grupo, (d) => d.mediana_geral, pesoTotal) ?? 0,
+      media_geral: ponderada(grupo, (d) => d.media_geral, pesoTotal) ?? 0,
+      mediana_agricola: ponderada(grupo, (d) => d.mediana_agricola, (d) => d.n_agricola),
+      media_agricola: ponderada(grupo, (d) => d.media_agricola, (d) => d.n_agricola),
+      mediana_pecuaria: ponderada(grupo, (d) => d.mediana_pecuaria, (d) => d.n_pecuaria),
+      media_pecuaria: ponderada(grupo, (d) => d.media_pecuaria, (d) => d.n_pecuaria),
+      mediana_floresta_plantada: ponderada(
+        grupo, (d) => d.mediana_floresta_plantada, (d) => d.n_floresta_plantada,
+      ),
+      media_floresta_plantada: ponderada(
+        grupo, (d) => d.media_floresta_plantada, (d) => d.n_floresta_plantada,
+      ),
+      mediana_floresta_nativa: ponderada(
+        grupo, (d) => d.mediana_floresta_nativa, (d) => d.n_floresta_nativa,
+      ),
+      media_floresta_nativa: ponderada(
+        grupo, (d) => d.media_floresta_nativa, (d) => d.n_floresta_nativa,
+      ),
+      n_agricola: grupo.reduce((a, b) => a + b.n_agricola, 0),
+      n_pecuaria: grupo.reduce((a, b) => a + b.n_pecuaria, 0),
+      n_floresta_plantada: grupo.reduce((a, b) => a + b.n_floresta_plantada, 0),
+      n_floresta_nativa: grupo.reduce((a, b) => a + b.n_floresta_nativa, 0),
+      coef_dispersao_pct: ponderada(grupo, (d) => d.coef_dispersao_pct, pesoTotal) ?? 0,
+    };
+  });
+}
+
 function ordenarCategoriasDoMaiorAoMenor(cats: string[]): string[] {
   const numeroMax = (s: string): number => {
+    if (/^\s*mais de/i.test(s)) return Infinity;
     const ms = [...s.matchAll(/\d+(?:[.,]\d+)?/g)].map((m) => parseFloat(m[0].replace(',', '.')));
     return ms.length ? Math.max(...ms) : NaN;
   };
@@ -100,19 +178,46 @@ export default function Observatorio() {
 
   const [selRegiao, setSelRegiao] = useState('Todas');
   const [selEstado, setSelEstado] = useState('Todos');
-  const [selCategoria, setSelCategoria] = useState<string | null>(null);
+  const [selCategorias, setSelCategorias] = useState<string[]>([]);
   const [selMunicipio, setSelMunicipio] = useState('Todos');
+  const [selMercadoRegional, setSelMercadoRegional] = useState('Todos');
+  const [metrica, setMetrica] = useState<Metrica>('mediana');
+
+  const [catOpen, setCatOpen] = useState(false);
+  const catRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!catOpen) return;
+    const onClick = (e: MouseEvent) => {
+      if (catRef.current && !catRef.current.contains(e.target as Node)) setCatOpen(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, [catOpen]);
+  const toggleCategoria = (cat: string) => {
+    setSelCategorias((prev) =>
+      prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat],
+    );
+  };
+  const rotuloCategorias =
+    selCategorias.length === 0
+      ? 'Todos'
+      : selCategorias.length === 1
+        ? selCategorias[0]
+        : `${selCategorias.length} selecionados`;
+
+  const getGeral = (d: FazendaData) => (metrica === 'media' ? d.media_geral : d.mediana_geral);
+  const getAgricola = (d: FazendaData) => (metrica === 'media' ? d.media_agricola : d.mediana_agricola);
+  const getPecuaria = (d: FazendaData) => (metrica === 'media' ? d.media_pecuaria : d.mediana_pecuaria);
+  const getFlorestaPlantada = (d: FazendaData) =>
+    metrica === 'media' ? d.media_floresta_plantada : d.mediana_floresta_plantada;
+  const getFlorestaNativa = (d: FazendaData) =>
+    metrica === 'media' ? d.media_floresta_nativa : d.mediana_floresta_nativa;
+  const rotuloMetrica = metrica === 'media' ? 'Média' : 'Mediana';
 
   const categoriasOrdenadas = useMemo(
     () => ordenarCategoriasDoMaiorAoMenor(Array.from(new Set(dadosBase.map((d) => d.categoria_tamanho)))),
     [dadosBase],
   );
-
-  useEffect(() => {
-    if (selCategoria === null && categoriasOrdenadas.length > 0) {
-      setSelCategoria(categoriasOrdenadas[0]);
-    }
-  }, [categoriasOrdenadas, selCategoria]);
 
   const [geomRegiao, setGeomRegiao] = useState<Geometry | null>(null);
   const [geomEstado, setGeomEstado] = useState<Geometry | null>(null);
@@ -153,13 +258,89 @@ export default function Observatorio() {
     }
   };
 
+  const [baixando, setBaixando] = useState<'xlsx' | 'pdf' | null>(null);
+
+  const filtrosAtuais = () => ({
+    regiao: selRegiao !== 'Todas' ? selRegiao : undefined,
+    estado: selEstado !== 'Todos' ? selEstado : undefined,
+    categoria: selCategorias.length > 0 ? selCategorias.join(',') : undefined,
+    municipio: selMunicipio !== 'Todos' ? selMunicipio : undefined,
+    mercado_regional: selMercadoRegional !== 'Todos' ? selMercadoRegional : undefined,
+  });
+
+  const baixarArquivo = (blob: Blob, nome: string) => {
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = nome;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  };
+
+  const handleExportarXLSX = async () => {
+    try {
+      setBaixando('xlsx');
+      const res = await api.get('/relatorio/xlsx', {
+        params: filtrosAtuais(),
+        responseType: 'blob',
+        timeout: 180000,
+      });
+      const ts = new Date().toISOString().slice(0, 10);
+      baixarArquivo(res.data, `simet_${ts}.xlsx`);
+    } catch (e) {
+      setErro('Falha ao exportar XLSX: ' + (e instanceof Error ? e.message : ''));
+    } finally {
+      setBaixando(null);
+    }
+  };
+
+  const handleExportarPDF = async () => {
+    if (selEstado === 'Todos') {
+      setErro('Selecione uma UF antes de exportar o PDF.');
+      return;
+    }
+    try {
+      setBaixando('pdf');
+      const res = await api.get('/relatorio/pdf', {
+        params: {
+          estado: selEstado,
+          categoria: selCategorias.length > 0 ? selCategorias.join(',') : undefined,
+          mercado_regional: selMercadoRegional !== 'Todos' ? selMercadoRegional : undefined,
+        },
+        responseType: 'blob',
+        timeout: 180000,
+      });
+      const ts = new Date().toISOString().slice(0, 10);
+      baixarArquivo(res.data, `simet_${selEstado}_${ts}.pdf`);
+    } catch (e) {
+      setErro('Falha ao exportar PDF: ' + (e instanceof Error ? e.message : ''));
+    } finally {
+      setBaixando(null);
+    }
+  };
+
+  const baseMercado = useMemo(
+    () =>
+      selMercadoRegional === 'Todos'
+        ? dadosBase
+        : dadosBase.filter((d) => d.mercado_regional_codigo === selMercadoRegional),
+    [dadosBase, selMercadoRegional],
+  );
+
+  const regioesDisponiveis = useMemo(
+    () => Array.from(new Set(baseMercado.map((d) => d.regiao))).sort(),
+    [baseMercado],
+  );
+
   const estadosDisponiveis = useMemo(() => {
-    const base = selRegiao === 'Todas' ? dadosBase : dadosBase.filter((d) => d.regiao === selRegiao);
+    const base = selRegiao === 'Todas' ? baseMercado : baseMercado.filter((d) => d.regiao === selRegiao);
     return Array.from(new Set(base.map((d) => d.estado))).sort();
-  }, [dadosBase, selRegiao]);
+  }, [baseMercado, selRegiao]);
 
   const municipiosDisponiveis = useMemo(() => {
-    let base = dadosBase;
+    let base = baseMercado;
     if (selRegiao !== 'Todas') base = base.filter((d) => d.regiao === selRegiao);
     if (selEstado !== 'Todos') base = base.filter((d) => d.estado === selEstado);
     const totais = new Map<string, number>();
@@ -169,7 +350,11 @@ export default function Observatorio() {
     return Array.from(totais.entries())
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'pt-BR'))
       .map(([nome, total]) => ({ nome, total }));
-  }, [dadosBase, selRegiao, selEstado]);
+  }, [baseMercado, selRegiao, selEstado]);
+
+  useEffect(() => {
+    if (selRegiao !== 'Todas' && !regioesDisponiveis.includes(selRegiao)) setSelRegiao('Todas');
+  }, [regioesDisponiveis, selRegiao]);
 
   useEffect(() => {
     if (selEstado !== 'Todos' && !estadosDisponiveis.includes(selEstado)) setSelEstado('Todos');
@@ -186,12 +371,50 @@ export default function Observatorio() {
       dadosBase.filter((d) => {
         if (selRegiao !== 'Todas' && d.regiao !== selRegiao) return false;
         if (selEstado !== 'Todos' && d.estado !== selEstado) return false;
-        if (selCategoria && selCategoria !== 'Todos' && d.categoria_tamanho !== selCategoria) return false;
+        if (selCategorias.length > 0 && !selCategorias.includes(d.categoria_tamanho)) return false;
         if (selMunicipio !== 'Todos' && d.municipio !== selMunicipio) return false;
+        if (selMercadoRegional !== 'Todos' && d.mercado_regional_codigo !== selMercadoRegional) return false;
         return true;
       }),
-    [dadosBase, selRegiao, selEstado, selCategoria, selMunicipio],
+    [dadosBase, selRegiao, selEstado, selCategorias, selMunicipio, selMercadoRegional],
   );
+
+  // Quando 2+ tamanhos estao marcados, consolida as linhas do mesmo municipio
+  // em uma unica linha (ponderada pelo volume amostral)
+  const linhasTabela = useMemo(
+    () => (selCategorias.length >= 2 ? agregarPorMunicipio(dadosFiltrados) : dadosFiltrados),
+    [dadosFiltrados, selCategorias],
+  );
+
+  const mercadosDisponiveis = useMemo(() => {
+    let base = dadosBase;
+    if (selRegiao !== 'Todas') base = base.filter((d) => d.regiao === selRegiao);
+    if (selEstado !== 'Todos') base = base.filter((d) => d.estado === selEstado);
+    if (selMunicipio !== 'Todos') base = base.filter((d) => d.municipio === selMunicipio);
+    const porCodigo = new Map<string, { codigo: string; nome: string; ufs: Set<string> }>();
+    for (const d of base) {
+      if (!d.mercado_regional_codigo || !d.mercado_regional_nome) continue;
+      const cur = porCodigo.get(d.mercado_regional_codigo);
+      if (cur) {
+        cur.ufs.add(d.estado);
+      } else {
+        porCodigo.set(d.mercado_regional_codigo, {
+          codigo: d.mercado_regional_codigo,
+          nome: d.mercado_regional_nome,
+          ufs: new Set([d.estado]),
+        });
+      }
+    }
+    return Array.from(porCodigo.values())
+      .map((m) => ({ codigo: m.codigo, nome: m.nome, ufs: Array.from(m.ufs).sort() }))
+      .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+  }, [dadosBase, selRegiao, selEstado, selMunicipio]);
+
+  useEffect(() => {
+    if (selMercadoRegional !== 'Todos' && !mercadosDisponiveis.some((m) => m.codigo === selMercadoRegional)) {
+      setSelMercadoRegional('Todos');
+    }
+  }, [mercadosDisponiveis, selMercadoRegional]);
 
   useEffect(() => {
     setGeomRegiao(null);
@@ -241,14 +464,26 @@ export default function Observatorio() {
   const kpis = useMemo(() => {
     if (dadosFiltrados.length === 0) return { mediana: 0, media: 0, amostras: 0, dispersao: 0 };
     const amostras = dadosFiltrados.reduce((acc, c) => acc + c.total_anuncios_reais, 0);
-    const media = dadosFiltrados.reduce((acc, c) => acc + c.media_geral, 0) / dadosFiltrados.length;
     const dispersao =
       dadosFiltrados.reduce((acc, c) => acc + (c.coef_dispersao_pct || 0), 0) /
       dadosFiltrados.length;
-    const valores = dadosFiltrados.map((d) => d.mediana_geral).sort((a, b) => a - b);
-    const mid = Math.floor(valores.length / 2);
-    const mediana =
-      valores.length % 2 !== 0 ? valores[mid] : (valores[mid - 1] + valores[mid]) / 2;
+
+    const medianas = dadosFiltrados
+      .map((d) => d.mediana_geral)
+      .filter((v): v is number => v != null && isFinite(v))
+      .sort((a, b) => a - b);
+    const mid = Math.floor(medianas.length / 2);
+    const mediana = medianas.length === 0
+      ? 0
+      : medianas.length % 2 !== 0
+        ? medianas[mid]
+        : (medianas[mid - 1] + medianas[mid]) / 2;
+
+    const medias = dadosFiltrados
+      .map((d) => d.media_geral)
+      .filter((v): v is number => v != null && isFinite(v));
+    const media = medias.length === 0 ? 0 : medias.reduce((a, b) => a + b, 0) / medias.length;
+
     return { mediana, media, amostras, dispersao };
   }, [dadosFiltrados]);
 
@@ -282,20 +517,72 @@ export default function Observatorio() {
           </div>
         )}
 
-        <div className="bg-white p-6 rounded-xl border border-border shadow-sm grid grid-cols-1 md:grid-cols-4 gap-4">
+        <div className="bg-white p-6 rounded-xl border border-border shadow-sm grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-4">
           <div>
             <label className="text-xs font-bold text-muted-foreground uppercase mb-1 block">
               Tamanho da Propriedade
             </label>
+            <div ref={catRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setCatOpen((v) => !v)}
+                className={`${inputClass} text-left flex justify-between items-center`}
+                aria-haspopup="listbox"
+                aria-expanded={catOpen}
+              >
+                <span className="truncate">{rotuloCategorias}</span>
+                <ChevronDown
+                  size={16}
+                  className={`shrink-0 ml-2 transition-transform ${catOpen ? 'rotate-180' : ''}`}
+                />
+              </button>
+              {catOpen && (
+                <div
+                  role="listbox"
+                  className="absolute z-30 mt-1 w-full bg-white border border-border rounded-md shadow-lg max-h-64 overflow-auto"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSelCategorias([])}
+                    className="w-full text-left px-3 py-2 hover:bg-muted text-sm border-b border-border font-medium"
+                  >
+                    Todos (limpar seleção)
+                  </button>
+                  {categoriasOrdenadas.map((cat) => {
+                    const marcado = selCategorias.includes(cat);
+                    return (
+                      <label
+                        key={cat}
+                        className="flex items-center gap-2 px-3 py-2 hover:bg-muted cursor-pointer text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={marcado}
+                          onChange={() => toggleCategoria(cat)}
+                          className="accent-primary"
+                        />
+                        <span>{cat}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+          <div>
+            <label className="text-xs font-bold text-muted-foreground uppercase mb-1 block">
+              Mercado Regional
+            </label>
             <select
-              value={selCategoria ?? 'Todos'}
-              onChange={(e) => setSelCategoria(e.target.value)}
+              value={selMercadoRegional}
+              onChange={(e) => setSelMercadoRegional(e.target.value)}
               className={inputClass}
+              disabled={mercadosDisponiveis.length === 0}
             >
               <option value="Todos">Todos</option>
-              {categoriasOrdenadas.map((cat) => (
-                <option key={cat} value={cat}>
-                  {cat}
+              {mercadosDisponiveis.map((m) => (
+                <option key={m.codigo} value={m.codigo}>
+                  {m.ufs.length > 0 ? `${m.ufs.join('/')} · ` : ''}{m.nome}
                 </option>
               ))}
             </select>
@@ -308,13 +595,12 @@ export default function Observatorio() {
               value={selRegiao}
               onChange={(e) => setSelRegiao(e.target.value)}
               className={inputClass}
+              disabled={regioesDisponiveis.length === 0}
             >
               <option value="Todas">Todas</option>
-              <option value="Norte">Norte</option>
-              <option value="Nordeste">Nordeste</option>
-              <option value="Centro-Oeste">Centro-Oeste</option>
-              <option value="Sudeste">Sudeste</option>
-              <option value="Sul">Sul</option>
+              {regioesDisponiveis.map((r) => (
+                <option key={r} value={r}>{r}</option>
+              ))}
             </select>
           </div>
           <div>
@@ -361,43 +647,50 @@ export default function Observatorio() {
         ) : (
           <>
             <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-              {[
-                {
-                  t: 'Mediana (R$/ha)',
-                  v: formatBRL(kpis.mediana),
-                  i: BarChart3,
-                  c: 'bg-white border-l-4 border-l-primary',
-                },
-                {
-                  t: 'Preço Médio (R$/ha)',
-                  v: formatBRL(kpis.media),
-                  i: TrendingUp,
-                  c: 'bg-accent border',
-                },
-                {
-                  t: 'Volume Amostral',
-                  v: kpis.amostras.toLocaleString('pt-BR'),
-                  i: MapPin,
-                  c: 'bg-white border',
-                },
-                {
-                  t: 'Dispersão Média',
-                  v: `${kpis.dispersao.toFixed(1)}%`,
-                  i: BarChart3,
-                  c: 'bg-[#fffaeb] border border-[#fef0c7]',
-                },
-              ].map((k, i) => (
-                <div
-                  key={i}
-                  className={`${k.c} p-6 rounded-xl shadow-sm border-border flex justify-between`}
-                >
-                  <div>
-                    <p className="text-xs font-bold text-muted-foreground uppercase">{k.t}</p>
-                    <p className="text-2xl font-black mt-2 text-foreground">{k.v}</p>
-                  </div>
-                  <k.i size={32} className="text-primary opacity-20" />
+              {([
+                { id: 'mediana', t: 'Mediana (R$/ha)', v: formatBRL(kpis.mediana), i: BarChart3 },
+                { id: 'media',   t: 'Média (R$/ha)',   v: formatBRL(kpis.media),   i: TrendingUp },
+              ] as const).map((k) => {
+                const ativo = metrica === k.id;
+                return (
+                  <button
+                    key={k.id}
+                    type="button"
+                    onClick={() => setMetrica(k.id)}
+                    aria-pressed={ativo}
+                    title={ativo ? `${k.t} (selecionada)` : `Usar ${k.t} no detalhamento`}
+                    className={`p-6 rounded-xl shadow-sm flex justify-between text-left transition ${
+                      ativo
+                        ? 'bg-white border-l-4 border-l-primary ring-2 ring-primary/30'
+                        : 'bg-white border border-border hover:border-primary/40 hover:bg-muted/50 opacity-80'
+                    }`}
+                  >
+                    <div>
+                      <p className="text-xs font-bold text-muted-foreground uppercase">{k.t}</p>
+                      <p className="text-2xl font-black mt-2 text-foreground">{k.v}</p>
+                    </div>
+                    <k.i size={32} className="text-primary opacity-20" />
+                  </button>
+                );
+              })}
+              <div className="bg-white border border-border p-6 rounded-xl shadow-sm flex justify-between">
+                <div>
+                  <p className="text-xs font-bold text-muted-foreground uppercase">Volume Amostral</p>
+                  <p className="text-2xl font-black mt-2 text-foreground">
+                    {kpis.amostras.toLocaleString('pt-BR')}
+                  </p>
                 </div>
-              ))}
+                <MapPin size={32} className="text-primary opacity-20" />
+              </div>
+              <div className="bg-[#fffaeb] border border-[#fef0c7] p-6 rounded-xl shadow-sm flex justify-between">
+                <div>
+                  <p className="text-xs font-bold text-muted-foreground uppercase">Dispersão Média</p>
+                  <p className="text-2xl font-black mt-2 text-foreground">
+                    {kpis.dispersao.toFixed(1)}%
+                  </p>
+                </div>
+                <BarChart3 size={32} className="text-primary opacity-20" />
+              </div>
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[500px]">
@@ -451,7 +744,15 @@ export default function Observatorio() {
                             {d.municipio} - {d.estado}
                           </b>
                           <br />
-                          {formatBRL(d.mediana_geral)}
+                          {rotuloMetrica}: {formatBRL(getGeral(d))}
+                          {d.mercado_regional_nome && (
+                            <>
+                              <br />
+                              <span style={{ fontSize: 10, opacity: 0.7 }}>
+                                {d.mercado_regional_nome}
+                              </span>
+                            </>
+                          )}
                         </LeafletTooltip>
                       </CircleMarker>
                     ))}
@@ -460,8 +761,30 @@ export default function Observatorio() {
               </div>
 
               <div className="bg-white rounded-xl border border-border shadow-sm flex flex-col lg:col-span-2 overflow-hidden">
-                <div className="p-4 border-b border-border font-bold">
-                  Dados Detalhados ({dadosFiltrados.length})
+                <div className="p-4 border-b border-border font-bold flex items-center justify-between gap-3">
+                  <span>Dados Detalhados ({linhasTabela.length})</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleExportarXLSX}
+                      disabled={baixando !== null}
+                      title="Exportar XLSX (todos os registros filtrados)"
+                      className="p-2 rounded-md border border-border hover:bg-emerald-50 hover:border-emerald-300 transition disabled:opacity-50"
+                    >
+                      <FileSpreadsheet size={18} className="text-emerald-700" />
+                    </button>
+                    <button
+                      onClick={handleExportarPDF}
+                      disabled={baixando !== null || selEstado === 'Todos'}
+                      title={
+                        selEstado === 'Todos'
+                          ? 'Selecione uma UF para gerar o PDF'
+                          : `Exportar PDF da UF ${selEstado}`
+                      }
+                      className="p-2 rounded-md border border-border hover:bg-red-50 hover:border-red-300 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <FileText size={18} className="text-red-700" />
+                    </button>
+                  </div>
                 </div>
                 <div className="flex-1 overflow-auto">
                   <table className="w-full text-sm text-left">
@@ -469,16 +792,31 @@ export default function Observatorio() {
                       <tr>
                         <th className="px-3 py-3">Município</th>
                         <th className="px-3 py-3">UF</th>
-                        <th className="px-3 py-3">Categoria</th>
-                        <th className="px-3 py-3 text-right">Geral</th>
-                        <th className="px-3 py-3 text-right">Agrícola</th>
-                        <th className="px-3 py-3 text-right">Pecuária</th>
-                        <th className="px-3 py-3 text-right">F. Plantada</th>
-                        <th className="px-3 py-3 text-right">F. Nativa</th>
+                        <th className="px-3 py-3">Tamanho</th>
+                        <th className="px-3 py-3 text-right">
+                          <div>{rotuloMetrica} Geral</div>
+                          <div className="text-[10px] font-normal normal-case text-muted-foreground/80">R$/ha</div>
+                        </th>
+                        <th className="px-3 py-3 text-right">
+                          <div>Agrícola</div>
+                          <div className="text-[10px] font-normal normal-case text-muted-foreground/80">R$/ha</div>
+                        </th>
+                        <th className="px-3 py-3 text-right">
+                          <div>Pecuária</div>
+                          <div className="text-[10px] font-normal normal-case text-muted-foreground/80">R$/ha</div>
+                        </th>
+                        <th className="px-3 py-3 text-right">
+                          <div>Floresta Plantada</div>
+                          <div className="text-[10px] font-normal normal-case text-muted-foreground/80">R$/ha</div>
+                        </th>
+                        <th className="px-3 py-3 text-right">
+                          <div>Floresta Nativa</div>
+                          <div className="text-[10px] font-normal normal-case text-muted-foreground/80">R$/ha</div>
+                        </th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
-                      {dadosFiltrados.slice(0, 100).map((r, i) => (
+                      {linhasTabela.slice(0, 100).map((r, i) => (
                         <tr key={i} className="hover:bg-muted/50">
                           <td className="px-3 py-3 font-medium">{r.municipio}</td>
                           <td className="px-3 py-3">{r.estado}</td>
@@ -486,25 +824,25 @@ export default function Observatorio() {
                             {r.categoria_tamanho}
                           </td>
                           <td className="px-3 py-3 text-right text-primary font-bold">
-                            {formatBRL(r.mediana_geral)}
+                            {formatBRL(getGeral(r))}
                           </td>
                           <td className="px-3 py-3 text-right" title={`${r.n_agricola} amostras`}>
-                            {formatBRL(r.mediana_agricola)}
+                            {formatBRL(getAgricola(r))}
                           </td>
                           <td className="px-3 py-3 text-right" title={`${r.n_pecuaria} amostras`}>
-                            {formatBRL(r.mediana_pecuaria)}
+                            {formatBRL(getPecuaria(r))}
                           </td>
                           <td
                             className="px-3 py-3 text-right"
                             title={`${r.n_floresta_plantada} amostras`}
                           >
-                            {formatBRL(r.mediana_floresta_plantada)}
+                            {formatBRL(getFlorestaPlantada(r))}
                           </td>
                           <td
                             className="px-3 py-3 text-right"
                             title={`${r.n_floresta_nativa} amostras`}
                           >
-                            {formatBRL(r.mediana_floresta_nativa)}
+                            {formatBRL(getFlorestaNativa(r))}
                           </td>
                         </tr>
                       ))}

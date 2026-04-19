@@ -1,15 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
   <defs>
-    <linearGradient id="incraGreen" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#B5D97A"/>
+    <radialGradient id="g" cx="50%" cy="55%" r="70%">
+      <stop offset="0%" stop-color="#8FC04E"/>
       <stop offset="55%" stop-color="#6FA030"/>
       <stop offset="100%" stop-color="#3D6A1C"/>
-    </linearGradient>
+    </radialGradient>
   </defs>
-  <rect x="22" y="6" width="9" height="9" rx="1" fill="url(#incraGreen)"/>
-  <rect x="33" y="6" width="9" height="9" rx="1" fill="url(#incraGreen)"/>
-  <rect x="27" y="17" width="9" height="9" rx="1" fill="url(#incraGreen)"/>
-  <rect x="38" y="17" width="9" height="9" rx="1" fill="url(#incraGreen)"/>
-  <path d="M 4 32 L 29 30 L 31 56 L 1 60 Z" fill="url(#incraGreen)"/>
-  <path d="M 33 30 L 60 32 L 63 60 L 35 56 Z" fill="url(#incraGreen)"/>
+  <g fill="url(#g)">
+    <polygon points="112,20 148,14 170,28 138,36"/>
+    <polygon points="158,12 196,6 224,20 192,28"/>
+    <polygon points="96,40 142,48 166,62 126,74"/>
+    <polygon points="160,50 210,42 236,58 196,70"/>
+    <polygon points="8,112 116,98 134,210 28,232"/>
+    <polygon points="140,96 248,110 248,220 148,210"/>
+  </g>
 </svg>
