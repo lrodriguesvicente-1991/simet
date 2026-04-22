@@ -18,6 +18,5 @@ frontend_react/node_modules/
 frontend_react/dist/
 
 # Ferramentas/configs locais
-.claude/
 .vscode/
 .idea/
