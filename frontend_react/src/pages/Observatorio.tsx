@@ -205,6 +205,17 @@ export default function Observatorio() {
         ? selCategorias[0]
         : `${selCategorias.length} selecionados`;
 
+  // Ao trocar o municipio, preenche estado/regiao automaticamente quando ainda
+  // estiverem em "Todos"/"Todas". Mantem as selecoes ja explicitadas pelo usuario.
+  const handleMunicipioChange = (nome: string) => {
+    setSelMunicipio(nome);
+    if (nome === 'Todos') return;
+    const linha = dadosBase.find((d) => d.municipio === nome);
+    if (!linha) return;
+    if (selEstado === 'Todos') setSelEstado(linha.estado);
+    if (selRegiao === 'Todas') setSelRegiao(linha.regiao);
+  };
+
   const getGeral = (d: FazendaData) => (metrica === 'media' ? d.media_geral : d.mediana_geral);
   const getAgricola = (d: FazendaData) => (metrica === 'media' ? d.media_agricola : d.mediana_agricola);
   const getPecuaria = (d: FazendaData) => (metrica === 'media' ? d.media_pecuaria : d.mediana_pecuaria);
@@ -464,25 +475,25 @@ export default function Observatorio() {
   const kpis = useMemo(() => {
     if (dadosFiltrados.length === 0) return { mediana: 0, media: 0, amostras: 0, dispersao: 0 };
     const amostras = dadosFiltrados.reduce((acc, c) => acc + c.total_anuncios_reais, 0);
-    const dispersao =
-      dadosFiltrados.reduce((acc, c) => acc + (c.coef_dispersao_pct || 0), 0) /
-      dadosFiltrados.length;
 
-    const medianas = dadosFiltrados
-      .map((d) => d.mediana_geral)
-      .filter((v): v is number => v != null && isFinite(v))
-      .sort((a, b) => a - b);
-    const mid = Math.floor(medianas.length / 2);
-    const mediana = medianas.length === 0
-      ? 0
-      : medianas.length % 2 !== 0
-        ? medianas[mid]
-        : (medianas[mid - 1] + medianas[mid]) / 2;
-
-    const medias = dadosFiltrados
-      .map((d) => d.media_geral)
-      .filter((v): v is number => v != null && isFinite(v));
-    const media = medias.length === 0 ? 0 : medias.reduce((a, b) => a + b, 0) / medias.length;
+    // Todos os agregados abaixo sao ponderados pelo volume amostral, alinhando o
+    // calculo dos KPIs com a agregacao da tabela detalhada (agregarPorMunicipio).
+    let somaMediana = 0;
+    let somaMedia = 0;
+    let somaDispersao = 0;
+    let pesos = 0;
+    for (const d of dadosFiltrados) {
+      const p = d.total_anuncios_reais;
+      if (p <= 0) continue;
+      if (d.mediana_geral != null && isFinite(d.mediana_geral)) somaMediana += d.mediana_geral * p;
+      if (d.media_geral != null && isFinite(d.media_geral)) somaMedia += d.media_geral * p;
+      if (d.coef_dispersao_pct != null && isFinite(d.coef_dispersao_pct))
+        somaDispersao += d.coef_dispersao_pct * p;
+      pesos += p;
+    }
+    const mediana = pesos > 0 ? somaMediana / pesos : 0;
+    const media = pesos > 0 ? somaMedia / pesos : 0;
+    const dispersao = pesos > 0 ? somaDispersao / pesos : 0;
 
     return { mediana, media, amostras, dispersao };
   }, [dadosFiltrados]);
@@ -626,7 +637,7 @@ export default function Observatorio() {
             </label>
             <select
               value={selMunicipio}
-              onChange={(e) => setSelMunicipio(e.target.value)}
+              onChange={(e) => handleMunicipioChange(e.target.value)}
               className={inputClass}
               disabled={municipiosDisponiveis.length === 0}
             >
