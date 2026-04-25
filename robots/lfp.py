@@ -12,6 +12,7 @@ from playwright.sync_api import sync_playwright
 
 from database.connection import obter_conexao
 from database.engine import obter_tarefas_ativas, salvar_na_fila
+from robots._controle import foi_solicitado_parar
 
 try:
     from playwright_stealth import stealth_sync
@@ -79,7 +80,7 @@ def executar_lfp(tarefas=None, evento_fim=None):
     if not tarefas: 
         return
     
-    print("[LFP] Iniciando motores de rede...", flush=True)
+    print("[LFP] Abrindo navegador...", flush=True)
     conn = obter_conexao()
     total_geral_novos = 0
     modo_headless = os.getenv("SIMET_HEADLESS", "0") == "1"
@@ -100,18 +101,24 @@ def executar_lfp(tarefas=None, evento_fim=None):
         
         for t in tarefas:
             if evento_fim and evento_fim.is_set(): break
-            
+            if foi_solicitado_parar():
+                print("[LFP] Parando varredura...", flush=True)
+                break
+
             cfg_id, sigla, fonte, url_busca, p_max = t
             pag = 1
             erros_consecutivos = 0
-            paginas_sem_novos = 0  
-            links_da_pagina_anterior = set() 
-            
+            paginas_sem_novos = 0
+            links_da_pagina_anterior = set()
+
             while True:
                 if evento_fim and evento_fim.is_set(): break
+                if foi_solicitado_parar():
+                    print(f"[LFP] Parando {sigla}...", flush=True)
+                    break
                 if p_max > 0 and pag > p_max: break
                 if erros_consecutivos >= 5: 
-                    print(f"[LFP] Limite de exceções excedido em {sigla}. Abortando.", flush=True)
+                    print(f"[LFP] Muitos erros seguidos em {sigla} — interrompendo varredura.", flush=True)
                     break
                 
                 limite_str = str(p_max) if p_max > 0 else "sem limite"
@@ -132,7 +139,7 @@ def executar_lfp(tarefas=None, evento_fim=None):
                     links_da_pagina_atual = {ad['url'] for ad in ads}
                     
                     if not links_da_pagina_atual or links_da_pagina_atual == links_da_pagina_anterior:
-                        print(f"[LFP] Fim da paginação em {sigla}.", flush=True)
+                        print(f"[LFP] Última página alcançada em {sigla}.", flush=True)
                         break
                         
                     erros_consecutivos = 0
@@ -148,10 +155,10 @@ def executar_lfp(tarefas=None, evento_fim=None):
                     print(f"[LFP] Leitura concluída: {sigla} (Pág {pag}) | Amostras: {len(ads)} | Inserções: {novos}", flush=True)
                     
                     if modo_nav == "RAPIDA" and paginas_sem_novos >= 2:
-                        print(f"[LFP] Saturação atingida ({sigla}): Nenhuma amostra nova.", flush=True)
+                        print(f"[LFP] Sem mais anúncios novos em {sigla}.", flush=True)
                         break
                     elif modo_nav == "PROFUNDA" and paginas_sem_novos >= 10:
-                        print(f"[LFP] Saturação atingida na Varredura Profunda ({sigla}).", flush=True)
+                        print(f"[LFP] Sem mais anúncios novos em {sigla} (varredura profunda).", flush=True)
                         break
                     
                     links_da_pagina_anterior = links_da_pagina_atual
@@ -162,7 +169,7 @@ def executar_lfp(tarefas=None, evento_fim=None):
                     
                 except Exception as e:
                     erros_consecutivos += 1
-                    print(f"[LFP] ERRO pag {pag}: {str(e)[:50]}", flush=True)
+                    print(f"[LFP] Erro na página {pag}: {str(e)[:50]}", flush=True)
                     time.sleep(5)
                     
         browser.close()

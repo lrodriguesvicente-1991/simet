@@ -1,22 +1,43 @@
-# Ignora o ambiente virtual Python
+# Ambiente virtual Python
 .venv/
 venv/
 env/
 
-# Ignora arquivos compilados do Python
+# Compilados do Python
 __pycache__/
 *.pyc
+*.pyo
 
-# Ignora o arquivo de variáveis de ambiente (onde ficam senhas)
+# Variáveis de ambiente (senhas, tokens, etc.)
 .env
+.env.local
 
-# Ignora os pacotes gigantes do React (O PULO DO GATO)
+# Pacotes gigantes do front
 node_modules/
 frontend_react/node_modules/
 
-# Ignora build de produção do front
+# Build de produção do front + cache do Vite
 frontend_react/dist/
+frontend_react/.vite/
+frontend_react/node_modules/.vite/
 
 # Ferramentas/configs locais
 .vscode/
 .idea/
+
+# Vault Obsidian (notas pessoais do projeto, fora do git)
+docs/
+
+# Artefatos gerados localmente pelos scripts auxiliares
+simet.ico
+
+# Arquivos de sistema operacional
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Logs e backups soltos
+*.log
+*.bak
+*.tmp
+*.swp

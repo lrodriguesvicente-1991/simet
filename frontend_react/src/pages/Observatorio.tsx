@@ -10,7 +10,7 @@ import {
 import L from 'leaflet';
 import type { Geometry } from 'geojson';
 import 'leaflet/dist/leaflet.css';
-import { AlertTriangle, BarChart3, ChevronDown, FileSpreadsheet, FileText, MapPin, RefreshCw, TrendingUp } from 'lucide-react';
+import { AlertTriangle, BarChart3, ChevronDown, FileSpreadsheet, FileText, Landmark, MapPin, RefreshCw, TrendingUp } from 'lucide-react';
 import { api } from '@/lib/api';
 
 interface FazendaData {
@@ -269,7 +269,7 @@ export default function Observatorio() {
     }
   };
 
-  const [baixando, setBaixando] = useState<'xlsx' | 'pdf' | null>(null);
+  const [baixando, setBaixando] = useState<'xlsx' | 'pdf' | 'grandes-xlsx' | 'grandes-pdf' | null>(null);
 
   const filtrosAtuais = () => ({
     regiao: selRegiao !== 'Todas' ? selRegiao : undefined,
@@ -327,6 +327,56 @@ export default function Observatorio() {
       baixarArquivo(res.data, `simet_${selEstado}_${ts}.pdf`);
     } catch (e) {
       setErro('Falha ao exportar PDF: ' + (e instanceof Error ? e.message : ''));
+    } finally {
+      setBaixando(null);
+    }
+  };
+
+  const filtrosGrandes = () => ({
+    regiao: selRegiao !== 'Todas' ? selRegiao : undefined,
+    estado: selEstado !== 'Todos' ? selEstado : undefined,
+    municipio: selMunicipio !== 'Todos' ? selMunicipio : undefined,
+    mercado_regional: selMercadoRegional !== 'Todos' ? selMercadoRegional : undefined,
+  });
+
+  const handleExportarGrandesXLSX = async () => {
+    try {
+      setBaixando('grandes-xlsx');
+      const res = await api.get('/relatorio/grandes-propriedades/xlsx', {
+        params: filtrosGrandes(),
+        responseType: 'blob',
+        timeout: 180000,
+      });
+      const ts = new Date().toISOString().slice(0, 10);
+      baixarArquivo(res.data, `simet_grandes_propriedades_${ts}.xlsx`);
+    } catch (e) {
+      setErro('Falha ao exportar XLSX (Grandes Propriedades): ' + (e instanceof Error ? e.message : ''));
+    } finally {
+      setBaixando(null);
+    }
+  };
+
+  const handleExportarGrandesPDF = async () => {
+    if (selEstado === 'Todos') {
+      setErro('Selecione uma UF antes de exportar o PDF de Grandes Propriedades.');
+      return;
+    }
+    try {
+      setBaixando('grandes-pdf');
+      const res = await api.get('/relatorio/grandes-propriedades/pdf', {
+        params: {
+          estado: selEstado,
+          regiao: selRegiao !== 'Todas' ? selRegiao : undefined,
+          municipio: selMunicipio !== 'Todos' ? selMunicipio : undefined,
+          mercado_regional: selMercadoRegional !== 'Todos' ? selMercadoRegional : undefined,
+        },
+        responseType: 'blob',
+        timeout: 180000,
+      });
+      const ts = new Date().toISOString().slice(0, 10);
+      baixarArquivo(res.data, `simet_grandes_propriedades_${selEstado}_${ts}.pdf`);
+    } catch (e) {
+      setErro('Falha ao exportar PDF (Grandes Propriedades): ' + (e instanceof Error ? e.message : ''));
     } finally {
       setBaixando(null);
     }
@@ -794,6 +844,29 @@ export default function Observatorio() {
                       className="p-2 rounded-md border border-border hover:bg-red-50 hover:border-red-300 transition disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <FileText size={18} className="text-red-700" />
+                    </button>
+                    <span className="mx-1 h-6 w-px bg-border" aria-hidden />
+                    <button
+                      onClick={handleExportarGrandesXLSX}
+                      disabled={baixando !== null}
+                      title="Relatório de Grandes Propriedades · XLSX (fazendas ≥ 50 ha, layout INCRA/UFF)"
+                      className="p-2 rounded-md border border-border hover:bg-amber-50 hover:border-amber-300 transition disabled:opacity-50 flex items-center gap-1"
+                    >
+                      <Landmark size={18} className="text-amber-700" />
+                      <FileSpreadsheet size={14} className="text-amber-700" />
+                    </button>
+                    <button
+                      onClick={handleExportarGrandesPDF}
+                      disabled={baixando !== null || selEstado === 'Todos'}
+                      title={
+                        selEstado === 'Todos'
+                          ? 'Selecione uma UF para gerar o PDF de Grandes Propriedades'
+                          : `Relatório de Grandes Propriedades · PDF da UF ${selEstado} (fazendas ≥ 50 ha)`
+                      }
+                      className="p-2 rounded-md border border-border hover:bg-amber-50 hover:border-amber-300 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                    >
+                      <Landmark size={18} className="text-amber-700" />
+                      <FileText size={14} className="text-amber-700" />
                     </button>
                   </div>
                 </div>

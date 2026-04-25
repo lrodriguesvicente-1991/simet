@@ -36,7 +36,7 @@ export default function Layout() {
         className={`${open ? 'w-64' : 'w-20'} bg-white border-r border-border transition-all duration-300 flex flex-col z-20`}
       >
         <div className="p-6 border-b border-border flex items-center gap-3">
-          <img src="/Logo_INCRA.svg_-1.png" alt="SIMET INCRA" className="w-10 h-10 shrink-0 object-contain" />
+          <img src="/favicon.png" alt="SIMET INCRA" className="w-10 h-10 shrink-0 object-contain" />
           {open && <span className="font-bold text-lg text-primary">SIMET INCRA</span>}
         </div>
 

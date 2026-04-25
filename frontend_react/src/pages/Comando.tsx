@@ -23,13 +23,16 @@ import {
   Sparkles,
   Zap,
 } from 'lucide-react';
+import { useState } from 'react';
 import {
   formatarValor,
   useRobo,
+  type AciState,
   type EventoFeed,
   type LfpState,
   type Operacao,
   type StatusWorker,
+  type TestState,
   type WorkerState,
 } from '@/contexts/RoboContext';
 
@@ -213,11 +216,14 @@ const STATUS: Record<StatusWorker, DefStatus> = {
 export default function Comando() {
   const {
     rodando,
+    parando,
     circuitBreaker,
     circuitBreakerMsg,
     logs,
     workersList,
     lfpState,
+    aciState,
+    testState,
     eventos,
     totais,
     operacao,
@@ -232,13 +238,18 @@ export default function Comando() {
     setMostrarCru,
     iniciar,
     parar,
+    pararForcado,
     reconhecerAlarme,
   } = useRobo();
+
+  const [confirmarParada, setConfirmarParada] = useState(false);
 
   const opAtual = OPERACOES.find((o) => o.id === operacao)!;
   const risco = calcularRisco(delayExtra);
   const mostrarLFP = operacao === 'full' || operacao === 'lfp';
   const mostrarWorkers = operacao === 'full' || operacao === 'eci';
+  const mostrarACI = operacao === 'aci';
+  const mostrarTest = operacao === 'test';
 
   return (
     <>
@@ -444,9 +455,18 @@ export default function Comando() {
               >
                 <Cpu size={18} /> Iniciar operação
               </button>
+            ) : parando ? (
+              <button
+                type="button"
+                disabled
+                className="bg-amber-500 text-white font-bold py-3 px-6 rounded-lg shadow flex justify-center items-center gap-2 min-w-[200px] cursor-wait"
+              >
+                <Loader2 size={18} className="animate-spin" />
+                Encerrando…
+              </button>
             ) : (
               <button
-                onClick={parar}
+                onClick={() => setConfirmarParada(true)}
                 className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-6 rounded-lg shadow flex justify-center items-center gap-2 transition min-w-[200px]"
               >
                 <AlertTriangle size={18} /> Parar operação
@@ -454,6 +474,67 @@ export default function Comando() {
             )}
           </div>
         </section>
+
+        {/* Modal de confirmação de parada */}
+        {confirmarParada && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+            onClick={() => setConfirmarParada(false)}
+          >
+            <div
+              className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-start gap-3 mb-4">
+                <div className="bg-red-50 text-red-600 p-2 rounded-full shrink-0">
+                  <AlertTriangle size={20} />
+                </div>
+                <div>
+                  <h3 className="font-bold text-lg">Encerrar a operação?</h3>
+                  <p className="text-sm text-muted-foreground mt-1">
+                    Os workers vão terminar o anúncio atual e depois encerrar —
+                    nada fica pela metade na base. Pode levar alguns segundos até
+                    todos pararem.
+                  </p>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmarParada(false)}
+                  className="px-4 py-2 rounded-md text-sm font-medium bg-muted hover:bg-muted/70 transition"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setConfirmarParada(false);
+                    parar();
+                  }}
+                  className="px-4 py-2 rounded-md text-sm font-bold bg-red-600 hover:bg-red-700 text-white transition"
+                >
+                  Sim, encerrar
+                </button>
+              </div>
+              <div className="mt-4 pt-3 border-t border-border text-[11px] text-muted-foreground">
+                Se travar e precisar encerrar à força:
+                <button
+                  type="button"
+                  onClick={() => {
+                    setConfirmarParada(false);
+                    pararForcado();
+                  }}
+                  className="ml-2 underline hover:text-red-600"
+                >
+                  parar à força (kill)
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ==== Painel ao vivo ==== */}
         <section className="space-y-4">
@@ -490,6 +571,12 @@ export default function Comando() {
 
           {/* LFP */}
           {mostrarLFP && <CardLFP estado={lfpState} rodando={rodando} />}
+
+          {/* ACI */}
+          {mostrarACI && <CardACI estado={aciState} rodando={rodando} />}
+
+          {/* Test (3 cards: validos / fila / erros) */}
+          {mostrarTest && <CardsTest estado={testState} rodando={rodando} />}
 
           {/* Grid de workers */}
           {mostrarWorkers && (
@@ -745,6 +832,188 @@ function CardLFP({ estado, rodando }: { estado: LfpState; rodando: boolean }) {
   );
 }
 
+function CardACI({ estado, rodando }: { estado: AciState; rodando: boolean }) {
+  const ativo = estado.ativo && rodando;
+  const pct =
+    estado.totalAuditar > 0
+      ? Math.min(100, Math.round((estado.auditados / estado.totalAuditar) * 100))
+      : null;
+
+  const iconeWrapCls = estado.finalizado
+    ? 'bg-emerald-50 text-emerald-600'
+    : ativo
+    ? 'bg-amber-50 text-amber-600'
+    : 'bg-slate-100 text-slate-400';
+
+  const cardCls = estado.finalizado
+    ? 'bg-white border border-emerald-300 ring-1 ring-emerald-200 rounded-xl p-4 shadow-sm'
+    : 'bg-white border border-border rounded-xl p-4 shadow-sm';
+
+  const totalReciclados = estado.reciclados + estado.recicladosIA;
+
+  return (
+    <div className={cardCls}>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <div className={`p-2 rounded-lg ${iconeWrapCls}`}>
+            {estado.finalizado ? (
+              <CheckCircle2 size={18} />
+            ) : ativo ? (
+              <ShieldCheck size={18} className="animate-pulse" />
+            ) : (
+              <ShieldCheck size={18} />
+            )}
+          </div>
+          <div>
+            <div className="font-bold text-sm flex items-center gap-2">
+              Auditor de anúncios
+              {estado.finalizado && (
+                <span className="text-[10px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded">
+                  Concluído
+                </span>
+              )}
+            </div>
+            <div className={`text-[11px] ${estado.finalizado ? 'text-emerald-700 font-semibold' : 'text-muted-foreground'}`}>
+              {estado.finalizado
+                ? `Auditoria concluída · ${estado.auditados} anúncios revisados`
+                : ativo && estado.filIdAtual
+                ? `Verificando #${estado.filIdAtual}${estado.motivoAtual ? ` · ${estado.motivoAtual}` : ''}`
+                : ativo
+                ? 'Iniciando auditoria...'
+                : rodando
+                ? 'Preparando a auditoria...'
+                : 'Parado'}
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-4 text-xs">
+          <div className="text-right">
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">Reciclados</div>
+            <div className="font-bold text-emerald-600">{totalReciclados}</div>
+          </div>
+          <div className="text-right">
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">Rejeitados</div>
+            <div className="font-bold text-red-600">{estado.rejeitadosIA}</div>
+          </div>
+          <div className="text-right">
+            <div className="text-[10px] text-muted-foreground uppercase tracking-wide">Descartados</div>
+            <div className="font-bold text-slate-600">{estado.descartados}</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Progresso */}
+      <div className="space-y-1">
+        <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+          <span>
+            {estado.totalAuditar > 0
+              ? `${estado.auditados} / ${estado.totalAuditar} anúncios`
+              : 'Nenhum lote em andamento'}
+          </span>
+          {totalReciclados > 0 && (
+            <span>
+              {estado.reciclados > 0 && `${estado.reciclados} → fila normal`}
+              {estado.reciclados > 0 && estado.recicladosIA > 0 && ' · '}
+              {estado.recicladosIA > 0 && `${estado.recicladosIA} → fila IA`}
+            </span>
+          )}
+        </div>
+        <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+          {pct !== null ? (
+            <div
+              className="h-full bg-amber-500 transition-all"
+              style={{ width: `${pct}%` }}
+            />
+          ) : ativo ? (
+            <div className="h-full bg-gradient-to-r from-amber-200 via-amber-500 to-amber-200 bg-[length:200%_100%] animate-[shimmer_1.5s_infinite]" />
+          ) : (
+            <div className="h-full bg-transparent" />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CardsTest({ estado, rodando }: { estado: TestState; rodando: boolean }) {
+  const concluido = estado.validos !== null && estado.fila !== null && estado.erros !== null;
+  const aguardando = rodando && !concluido;
+
+  const fmt = (n: number | null): string =>
+    n === null ? '—' : n.toLocaleString('pt-BR');
+
+  type Card = {
+    label: string;
+    valor: number | null;
+    icone: typeof Database;
+    cor: string;
+    bg: string;
+    ring: string;
+  };
+
+  const cards: Card[] = [
+    {
+      label: 'Anúncios válidos',
+      valor: estado.validos,
+      icone: CheckCircle2,
+      cor: 'text-emerald-600',
+      bg: 'bg-emerald-50',
+      ring: 'border-emerald-200',
+    },
+    {
+      label: 'Total na fila',
+      valor: estado.fila,
+      icone: Boxes,
+      cor: 'text-sky-600',
+      bg: 'bg-sky-50',
+      ring: 'border-sky-200',
+    },
+    {
+      label: 'Com erros',
+      valor: estado.erros,
+      icone: AlertTriangle,
+      cor: 'text-amber-600',
+      bg: 'bg-amber-50',
+      ring: 'border-amber-200',
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {cards.map((c) => {
+        const Icone = c.icone;
+        const vazio = c.valor === null;
+        return (
+          <div
+            key={c.label}
+            className={`bg-white border rounded-xl p-4 shadow-sm transition ${
+              vazio ? 'border-border' : c.ring
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-[11px] uppercase tracking-wide text-muted-foreground font-bold">
+                  {c.label}
+                </div>
+                <div className={`text-2xl font-bold mt-1 ${vazio ? 'text-slate-400' : c.cor}`}>
+                  {aguardando && vazio ? (
+                    <Loader2 size={22} className="animate-spin" />
+                  ) : (
+                    fmt(c.valor)
+                  )}
+                </div>
+              </div>
+              <div className={`p-2.5 rounded-lg ${c.bg} ${c.cor}`}>
+                <Icone size={20} />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function FeedAtividade({ eventos, rodando }: { eventos: EventoFeed[]; rodando: boolean }) {
   if (eventos.length === 0) {
     return (
@@ -766,10 +1035,13 @@ function FeedAtividade({ eventos, rodando }: { eventos: EventoFeed[]; rodando: b
       </div>
       <div className="max-h-96 overflow-y-auto divide-y divide-border/60">
         {eventos.slice(0, 80).map((ev) => {
-          const def = ev.status === 'lfp' || ev.status === 'system' ? null : STATUS[ev.status as StatusWorker];
-          const Icone = def?.icone ?? Radar;
-          const cor = def?.cor ?? 'text-sky-600';
-          const bg = def?.bg ?? 'bg-sky-50';
+          const isSpecial = ev.status === 'lfp' || ev.status === 'aci' || ev.status === 'system';
+          const def = isSpecial ? null : STATUS[ev.status as StatusWorker];
+          const isSystem = ev.status === 'system';
+          const isAci = ev.status === 'aci';
+          const Icone = isSystem ? Database : isAci ? ShieldCheck : (def?.icone ?? Radar);
+          const cor = isSystem ? 'text-slate-600' : isAci ? 'text-amber-600' : (def?.cor ?? 'text-sky-600');
+          const bg = isSystem ? 'bg-slate-100' : isAci ? 'bg-amber-50' : (def?.bg ?? 'bg-sky-50');
           return (
             <div key={ev.id} className="flex items-start gap-3 px-4 py-2 hover:bg-slate-50 transition">
               <div className={`mt-0.5 p-1.5 rounded-full ${bg} ${cor} shrink-0`}>
@@ -781,6 +1053,8 @@ function FeedAtividade({ eventos, rodando }: { eventos: EventoFeed[]; rodando: b
                     <span className="font-bold text-foreground mr-1.5">Worker {ev.worker}</span>
                   )}
                   {ev.status === 'lfp' && <span className="font-bold text-sky-700 mr-1.5">Mapeador</span>}
+                  {isAci && <span className="font-bold text-amber-700 mr-1.5">Auditor</span>}
+                  {isSystem && <span className="font-bold text-slate-700 mr-1.5">Sistema</span>}
                   <span className="text-muted-foreground">{ev.mensagem}</span>
                 </div>
                 {ev.detalhe && (

@@ -60,11 +60,33 @@ export interface LfpState {
   finalizado: boolean;
 }
 
+export interface TestState {
+  validos: number | null;     // Anuncios validos extraidos
+  fila: number | null;        // Total na fila (qualquer status)
+  erros: number | null;       // Com erro (aguarda ACI)
+  ultimoLogTs: number;
+}
+
+export interface AciState {
+  ativo: boolean;
+  totalAuditar: number;          // alvo informado no inicio
+  auditados: number;             // contagem corrente (incrementa em cada resultado)
+  reciclados: number;            // VIVO -> PENDENTE
+  recicladosIA: number;          // VIVO -> PENDENTE_IA
+  rejeitadosIA: number;          // VIVO + IA ja falhou -> REJEITADO_IA
+  descartados: number;           // MORTO -> descartado
+  filIdAtual: string | null;
+  motivoAtual: string | null;
+  ultimoLogTs: number;
+  ultimaLinha: string;
+  finalizado: boolean;
+}
+
 export interface EventoFeed {
   id: string;
   ts: number;
   worker: number | null;
-  status: StatusWorker | 'lfp' | 'system';
+  status: StatusWorker | 'lfp' | 'aci' | 'system';
   mensagem: string;
   detalhe?: string;
 }
@@ -86,8 +108,26 @@ const RE_ID_URL = /ID\s+(\S+)(?:\s+\|\s+(\S+))?/;
 const RE_ID_MUN = /ID\s+(\S+)\s+\|\s+([^/]+)\/(\w+)/;
 const RE_MODO = /modo=(IA|DETERMINISTICO)/i;
 const RE_LFP_VARRE = /^\[LFP\]\s+Varredura iniciada no estado\s+(\w+)\s+\|\s+Plataforma:\s+(\w+)\s+\|\s+Pág:\s+(\d+)\/(\S+)/;
-const RE_LFP_LEITURA = /^\[LFP\]\s+Leitura conclu[ií]da:\s+(\w+)\s+\(Pág\s+(\d+)\)\s+\|\s+Amostras:\s+(\d+)\s+\|\s+Inser[çc][ãa]o[ae]s:\s+(\d+)/;
+const RE_LFP_LEITURA = /^\[LFP\]\s+Leitura conclu[ií]da:\s+(\w+)\s+\(Pág\s+(\d+)\)\s+\|\s+Amostras:\s+(\d+)\s+\|\s+Inser[çc][õo]es:\s+(\d+)/;
 const RE_LFP_FIM_TOTAL = /^\[LFP\]\s+Opera[çc][ãa]o Finalizada\.\s+Total de novas inser[çc][õo]es:\s+(\d+)/;
+
+// Linhas do testar_conexao_banco() em main.py — popula os 3 cards do Test.
+const RE_TEST_VALIDOS = /^\[SYSTEM\]\s+Anuncios validos\s*\(extraidos\):\s*(\d+)/;
+const RE_TEST_FILA = /^\[SYSTEM\]\s+Total na fila\s*\(todos os status\):\s*(\d+)/;
+const RE_TEST_ERROS = /^\[SYSTEM\]\s+Com erro\s*\(aguarda ACI\):\s*(\d+)/;
+
+const RE_ACI_INICIO = /^\[ACI\]\s+Iniciando auditoria de\s+(\d+)/;
+const RE_ACI_FILA_VAZIA = /^\[ACI\]\s+Fila limpa/;
+const RE_ACI_AUDITANDO = /^\[ACI\]\s+Auditando ID\s+(\d+)\s+\(motivo:\s*(.+?)\)\.{2,}$/;
+// Resultados do ACI: o #fil_id no final tornou cada linha unica (antes,
+// "VIVO -> PENDENTE (retry deterministico)" era identico em toda iteracao
+// e o dedup do parser engolia todas apos a primeira). #(\d+) opcional
+// preserva compatibilidade com logs antigos.
+const RE_ACI_MORTO = /^\[ACI\]\s+MORTO\s*->\s*descartado(?:\s+#(\d+))?\s*\((.+)\)/;
+const RE_ACI_VIVO_PENDENTE = /^\[ACI\]\s+VIVO\s*->\s*PENDENTE(?:\s+#(\d+))?(?:\s|$)/;
+const RE_ACI_VIVO_PENDENTE_IA = /^\[ACI\]\s+VIVO\s*->\s*PENDENTE_IA(?:\s+#(\d+))?/;
+const RE_ACI_REJEITADO_IA = /^\[ACI\]\s+VIVO\s*\+\s*IA\s+ja\s+falhou\s*->\s*REJEITADO_IA(?:\s+#(\d+))?/;
+const RE_ACI_RESUMO = /^\[ACI\]\s+RESUMO:\s+(\d+)\s*->\s*PENDENTE\s*\|\s*(\d+)\s*->\s*PENDENTE_IA\s*\|\s*(\d+)\s*->\s*REJEITADO_IA\s*\|\s*(\d+)\s+descartados/;
 
 function interpretarTag(tag: string): StatusWorker | null {
   const t = tag.toUpperCase().replace(/\s+/g, ' ').trim();
@@ -125,17 +165,42 @@ const LFP_INICIAL: LfpState = {
   finalizado: false,
 };
 
+const TEST_INICIAL: TestState = {
+  validos: null,
+  fila: null,
+  erros: null,
+  ultimoLogTs: 0,
+};
+
+const ACI_INICIAL: AciState = {
+  ativo: false,
+  totalAuditar: 0,
+  auditados: 0,
+  reciclados: 0,
+  recicladosIA: 0,
+  rejeitadosIA: 0,
+  descartados: 0,
+  filIdAtual: null,
+  motivoAtual: null,
+  ultimoLogTs: 0,
+  ultimaLinha: '',
+  finalizado: false,
+};
+
 // =====================================================================
 // Contexto
 // =====================================================================
 interface RoboContextValue {
   // runtime (polling + parsing)
   rodando: boolean;
+  parando: boolean;
   circuitBreaker: boolean;
   circuitBreakerMsg: string | null;
   logs: string[];
   workersList: WorkerState[];
   lfpState: LfpState;
+  aciState: AciState;
+  testState: TestState;
   eventos: EventoFeed[];
   totais: Totais;
 
@@ -153,7 +218,8 @@ interface RoboContextValue {
 
   // ações
   iniciar: () => Promise<void>;
-  parar: () => Promise<void>;
+  parar: () => Promise<void>;          // parada graciosa
+  pararForcado: () => Promise<void>;   // fallback: taskkill
   reconhecerAlarme: () => Promise<void>;
 }
 
@@ -162,6 +228,7 @@ const RoboContext = createContext<RoboContextValue | null>(null);
 export function RoboProvider({ children }: { children: ReactNode }) {
   // Runtime state
   const [rodando, setRodando] = useState(false);
+  const [parando, setParando] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [circuitBreaker, setCircuitBreaker] = useState(false);
   const [circuitBreakerMsg, setCircuitBreakerMsg] = useState<string | null>(null);
@@ -176,6 +243,8 @@ export function RoboProvider({ children }: { children: ReactNode }) {
   // Refs de parsing (sobrevivem ao buffer de logs)
   const workersRef = useRef<Map<number, WorkerState>>(new Map());
   const lfpRef = useRef<LfpState>({ ...LFP_INICIAL });
+  const aciRef = useRef<AciState>({ ...ACI_INICIAL });
+  const testRef = useRef<TestState>({ ...TEST_INICIAL });
   const feedRef = useRef<EventoFeed[]>([]);
   const linhasVistas = useRef<Set<string>>(new Set());
   const lfpNotificadoRef = useRef(false);
@@ -193,8 +262,10 @@ export function RoboProvider({ children }: { children: ReactNode }) {
           logs_recentes: string[];
           circuit_breaker?: boolean;
           circuit_breaker_msg?: string | null;
+          parando?: boolean;
         }>('/robo/status');
         setRodando(res.data.rodando);
+        setParando(!!res.data.parando);
         setLogs(res.data.logs_recentes || []);
         setCircuitBreaker(!!res.data.circuit_breaker);
         setCircuitBreakerMsg(res.data.circuit_breaker_msg ?? null);
@@ -214,6 +285,8 @@ export function RoboProvider({ children }: { children: ReactNode }) {
     if (rodando && !prevRodando.current) {
       workersRef.current = new Map();
       lfpRef.current = { ...LFP_INICIAL };
+      aciRef.current = { ...ACI_INICIAL };
+      testRef.current = { ...TEST_INICIAL };
       feedRef.current = [];
       linhasVistas.current = new Set();
       lfpNotificadoRef.current = false;
@@ -320,6 +393,214 @@ export function RoboProvider({ children }: { children: ReactNode }) {
 
       if (linha.startsWith('[LFP]')) {
         lfpRef.current = { ...lfpRef.current, ultimoLogTs: agora, ultimaLinha: linha };
+        continue;
+      }
+
+      // ----- ACI (Auditor) — espelho do bloco LFP, mesmo padrao de eventos -----
+      const mAciInicio = linha.match(RE_ACI_INICIO);
+      if (mAciInicio) {
+        aciRef.current = {
+          ...ACI_INICIAL,
+          ativo: true,
+          totalAuditar: parseInt(mAciInicio[1], 10),
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Iniciando auditoria de ${mAciInicio[1]} anúncios`,
+        });
+        continue;
+      }
+
+      const mAciFilaVazia = linha.match(RE_ACI_FILA_VAZIA);
+      if (mAciFilaVazia) {
+        aciRef.current = {
+          ...ACI_INICIAL,
+          ativo: false,
+          finalizado: true,
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: 'Fila limpa · nenhum anúncio para auditar',
+        });
+        continue;
+      }
+
+      const mAciAuditando = linha.match(RE_ACI_AUDITANDO);
+      if (mAciAuditando) {
+        aciRef.current = {
+          ...aciRef.current,
+          ativo: true,
+          filIdAtual: mAciAuditando[1],
+          motivoAtual: mAciAuditando[2].trim(),
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Auditando #${mAciAuditando[1]}`,
+          detalhe: mAciAuditando[2].trim(),
+        });
+        continue;
+      }
+
+      const mAciMorto = linha.match(RE_ACI_MORTO);
+      if (mAciMorto) {
+        const idTxt = mAciMorto[1] ?? aciRef.current.filIdAtual;
+        aciRef.current = {
+          ...aciRef.current,
+          descartados: aciRef.current.descartados + 1,
+          auditados: aciRef.current.auditados + 1,
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Link morto · descartado${idTxt ? ` (#${idTxt})` : ''}`,
+          detalhe: mAciMorto[2],
+        });
+        continue;
+      }
+
+      const mAciRejIA = linha.match(RE_ACI_REJEITADO_IA);
+      if (mAciRejIA) {
+        const idTxt = mAciRejIA[1] ?? aciRef.current.filIdAtual;
+        aciRef.current = {
+          ...aciRef.current,
+          rejeitadosIA: aciRef.current.rejeitadosIA + 1,
+          auditados: aciRef.current.auditados + 1,
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Rejeitado pela IA · revisão humana${idTxt ? ` (#${idTxt})` : ''}`,
+        });
+        continue;
+      }
+
+      const mAciVivoIA = linha.match(RE_ACI_VIVO_PENDENTE_IA);
+      if (mAciVivoIA) {
+        const idTxt = mAciVivoIA[1] ?? aciRef.current.filIdAtual;
+        aciRef.current = {
+          ...aciRef.current,
+          recicladosIA: aciRef.current.recicladosIA + 1,
+          auditados: aciRef.current.auditados + 1,
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Reciclado para IA${idTxt ? ` (#${idTxt})` : ''}`,
+        });
+        continue;
+      }
+
+      const mAciVivo = linha.match(RE_ACI_VIVO_PENDENTE);
+      if (mAciVivo) {
+        const idTxt = mAciVivo[1] ?? aciRef.current.filIdAtual;
+        aciRef.current = {
+          ...aciRef.current,
+          reciclados: aciRef.current.reciclados + 1,
+          auditados: aciRef.current.auditados + 1,
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Reciclado para fila${idTxt ? ` (#${idTxt})` : ''}`,
+        });
+        continue;
+      }
+
+      const mAciResumo = linha.match(RE_ACI_RESUMO);
+      if (mAciResumo) {
+        const reciclados = parseInt(mAciResumo[1], 10);
+        const recicladosIA = parseInt(mAciResumo[2], 10);
+        const rejeitadosIA = parseInt(mAciResumo[3], 10);
+        const descartados = parseInt(mAciResumo[4], 10);
+        aciRef.current = {
+          ...aciRef.current,
+          ativo: false,
+          finalizado: true,
+          reciclados,
+          recicladosIA,
+          rejeitadosIA,
+          descartados,
+          auditados: reciclados + recicladosIA + rejeitadosIA + descartados,
+          ultimoLogTs: agora,
+          ultimaLinha: linha,
+        };
+        feedRef.current.unshift({
+          id: `${agora}-${Math.random()}`,
+          ts: agora,
+          worker: null,
+          status: 'aci',
+          mensagem: `Auditoria concluída · ${reciclados + recicladosIA} reciclados · ${rejeitadosIA} rejeitados · ${descartados} descartados`,
+        });
+        continue;
+      }
+
+      if (linha.startsWith('[ACI]')) {
+        aciRef.current = { ...aciRef.current, ultimoLogTs: agora, ultimaLinha: linha };
+        continue;
+      }
+
+      // [SYSTEM] e a unica fonte de feedback visual no Testar Conexao
+      // (que nao tem CardLFP nem CardWorker). Tambem cobre marcos de boot/fim
+      // e parada graciosa em outros modos.
+      if (linha.startsWith('[SYSTEM]')) {
+        // Captura totais do Testar Conexao para popular os 3 cards.
+        const mTV = linha.match(RE_TEST_VALIDOS);
+        if (mTV) {
+          testRef.current = { ...testRef.current, validos: parseInt(mTV[1], 10), ultimoLogTs: agora };
+        }
+        const mTF = linha.match(RE_TEST_FILA);
+        if (mTF) {
+          testRef.current = { ...testRef.current, fila: parseInt(mTF[1], 10), ultimoLogTs: agora };
+        }
+        const mTE = linha.match(RE_TEST_ERROS);
+        if (mTE) {
+          testRef.current = { ...testRef.current, erros: parseInt(mTE[1], 10), ultimoLogTs: agora };
+        }
+
+        const mensagem = linha
+          .replace(/^\[SYSTEM\]\s*/, '')
+          .replace(/\s{2,}/g, ' ')
+          .trim();
+        if (mensagem) {
+          feedRef.current.unshift({
+            id: `${agora}-${Math.random()}`,
+            ts: agora,
+            worker: null,
+            status: 'system',
+            mensagem,
+          });
+        }
         continue;
       }
 
@@ -524,8 +805,17 @@ export function RoboProvider({ children }: { children: ReactNode }) {
   const parar = useCallback(async () => {
     try {
       await api.post('/robo/parar');
+      setParando(true);
     } catch (e) {
       console.error('Erro ao parar robô', e);
+    }
+  }, []);
+
+  const pararForcado = useCallback(async () => {
+    try {
+      await api.post('/robo/parar?force=true');
+    } catch (e) {
+      console.error('Erro ao forçar parada', e);
     }
   }, []);
 
@@ -543,11 +833,14 @@ export function RoboProvider({ children }: { children: ReactNode }) {
     <RoboContext.Provider
       value={{
         rodando,
+        parando,
         circuitBreaker,
         circuitBreakerMsg,
         logs,
         workersList,
         lfpState: lfpRef.current,
+        aciState: aciRef.current,
+        testState: testRef.current,
         eventos: feedRef.current,
         totais,
         operacao,
@@ -562,6 +855,7 @@ export function RoboProvider({ children }: { children: ReactNode }) {
         setMostrarCru,
         iniciar,
         parar,
+        pararForcado,
         reconhecerAlarme,
       }}
     >

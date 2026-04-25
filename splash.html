@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SIMET · Iniciando…</title>
+<link rel="icon" type="image/png" href="frontend_react/public/favicon.png" />
+<style>
+  :root {
+    --verde: #6FA030;
+    --verde-escuro: #3D6A1C;
+    --bg-1: #0a1410;
+    --bg-2: #102018;
+    --texto: #d8e6dc;
+    --texto-suave: #7d9588;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--texto);
+    background: radial-gradient(ellipse at center, var(--bg-2) 0%, var(--bg-1) 70%);
+    overflow: hidden;
+  }
+  .palco {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 32px;
+    user-select: none;
+  }
+  .logo-wrap {
+    position: relative;
+    width: 160px;
+    height: 160px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .logo {
+    width: 96px;
+    height: 96px;
+    object-fit: contain;
+    background: transparent;
+    filter: drop-shadow(0 0 18px rgba(111, 160, 48, 0.45));
+    animation: pulsa 2.4s ease-in-out infinite;
+  }
+  /* Anel orbital ao redor do logo */
+  .anel {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: var(--verde);
+    border-right-color: rgba(111, 160, 48, 0.3);
+    animation: gira 1.4s linear infinite;
+  }
+  .anel.lento {
+    inset: 14px;
+    border-top-color: rgba(111, 160, 48, 0.5);
+    border-right-color: transparent;
+    animation: gira 2.8s linear infinite reverse;
+  }
+
+  .titulo {
+    font-size: 28px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    color: var(--verde);
+    text-shadow: 0 0 14px rgba(111, 160, 48, 0.35);
+  }
+  .subtitulo {
+    font-size: 13px;
+    color: var(--texto-suave);
+    text-align: center;
+    max-width: 360px;
+    line-height: 1.55;
+  }
+
+  .progresso {
+    width: 240px;
+    height: 4px;
+    background: rgba(111, 160, 48, 0.12);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .progresso > div {
+    width: 35%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, var(--verde), transparent);
+    animation: shimmer 1.6s ease-in-out infinite;
+  }
+
+  .status {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--texto-suave);
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    letter-spacing: 0.04em;
+    min-height: 18px;
+  }
+
+  .erro {
+    margin-top: 24px;
+    padding: 12px 18px;
+    background: rgba(220, 38, 38, 0.1);
+    border: 1px solid rgba(220, 38, 38, 0.4);
+    color: #fca5a5;
+    border-radius: 8px;
+    font-size: 12px;
+    max-width: 420px;
+    text-align: center;
+    display: none;
+  }
+  .erro.visivel { display: block; }
+
+  .botao {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 18px;
+    padding: 12px 28px;
+    background: var(--verde);
+    color: #0a1410;
+    text-decoration: none;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    border-radius: 8px;
+    box-shadow: 0 0 24px rgba(111, 160, 48, 0.4);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .botao:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 32px rgba(111, 160, 48, 0.6);
+  }
+  .botao::after {
+    content: "→";
+    font-size: 18px;
+    line-height: 1;
+  }
+
+  .rodape {
+    position: fixed;
+    bottom: 16px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 10px;
+    color: rgba(125, 149, 136, 0.6);
+    letter-spacing: 0.08em;
+  }
+
+  @keyframes pulsa {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50%      { transform: scale(1.04); opacity: 0.85; }
+  }
+  @keyframes gira {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+  @keyframes shimmer {
+    0%   { transform: translateX(-280%); }
+    100% { transform: translateX(380%); }
+  }
+</style>
+</head>
+<body>
+  <div class="palco">
+    <div class="logo-wrap">
+      <div class="anel"></div>
+      <div class="anel lento"></div>
+      <img class="logo" src="frontend_react/public/favicon.png" alt="SIMET" />
+    </div>
+
+    <div>
+      <div class="titulo">SIMET · INCRA</div>
+    </div>
+
+    <div class="subtitulo">Iniciando o sistema, isto pode levar alguns segundos…</div>
+
+    <div class="progresso"><div></div></div>
+    <div class="status" id="status">aguardando o servidor responder</div>
+
+    <a id="botao" href="#" class="botao" style="display:none" onclick="window.location.href='http://localhost:8000/?_t='+Date.now(); return false;">
+      Abrir SIMET
+    </a>
+
+    <div class="erro" id="erro"></div>
+  </div>
+
+  <div class="rodape">Sistema de Inteligência de Mercado de Terras</div>
+
+<script>
+(function () {
+  // Configuracao
+  var ALVO = "http://localhost:8000/";
+  var PING_URL = "http://localhost:8000/favicon.png?";
+  var INTERVALO_MS = 800;
+  var TIMEOUT_AVISO_MS = 60000;
+  var MOSTRAR_BOTAO_MS = 6000;
+
+  var statusEl = document.getElementById("status");
+  var erroEl = document.getElementById("erro");
+  var botaoEl = document.getElementById("botao");
+  var inicio = Date.now();
+  var redirecionou = false;
+
+  function decorridoSeg() {
+    return Math.floor((Date.now() - inicio) / 1000);
+  }
+
+  function redirecionar() {
+    if (redirecionou) return;
+    redirecionou = true;
+    statusEl.textContent = "servidor pronto · redirecionando…";
+    // Cache-buster: garante que o browser pegue index.html FRESCO do uvicorn
+    // ao inves de usar uma versao em cache que pode apontar pra bundles antigos.
+    var alvoFinal = ALVO + "?_t=" + Date.now();
+    setTimeout(function () { window.location.replace(alvoFinal); }, 200);
+  }
+
+  function pingar() {
+    if (redirecionou) return;
+    statusEl.textContent = "verificando servidor… (" + decorridoSeg() + "s)";
+
+    // fetch com no-cors: NAO depende do conteudo da resposta nem de CORS.
+    // - Se servidor reachable -> resolve com response opaque (sucesso)
+    // - Se servidor down -> rejeita com TypeError
+    // Usamos AbortSignal para nao deixar request pendurado.
+    var ctrl = new AbortController();
+    var alarme = setTimeout(function () { ctrl.abort(); }, 2500);
+
+    fetch(PING_URL + Date.now(), {
+      mode: 'no-cors',
+      cache: 'no-store',
+      signal: ctrl.signal,
+    }).then(function () {
+      clearTimeout(alarme);
+      redirecionar();
+    }).catch(function () {
+      clearTimeout(alarme);
+      if (Date.now() - inicio > TIMEOUT_AVISO_MS && !erroEl.classList.contains('visivel')) {
+        erroEl.textContent =
+          "O servidor não respondeu em " + Math.floor(TIMEOUT_AVISO_MS / 1000) +
+          "s. Verifique a janela do terminal. Você pode tentar abrir manualmente:";
+        erroEl.classList.add("visivel");
+      }
+      setTimeout(pingar, INTERVALO_MS);
+    });
+  }
+
+  // Mostra o botao manual depois de alguns segundos como rede de seguranca:
+  // se a auto-deteccao falhar (PNA do Chrome em file:// -> localhost, etc.),
+  // o usuario clica e vai direto.
+  setTimeout(function () {
+    if (!redirecionou) botaoEl.style.display = "inline-flex";
+  }, MOSTRAR_BOTAO_MS);
+
+  setTimeout(pingar, 200);
+})();
+</script>
+</body>
+</html>

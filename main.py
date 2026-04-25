@@ -14,23 +14,66 @@ from dotenv import load_dotenv
 from robots.lfp import executar_lfp
 from robots.eci import executar_eci_worker
 from robots.aci import executar_aci_separado
+from robots._controle import limpar_parada
 from database.connection import obter_conexao
-from database.engine import obter_tarefas_ativas
+from database.engine import contagem_saude_fila, diagnostico_completo, obter_tarefas_ativas
 
 load_dotenv()
 
 def testar_conexao_banco():
-    print("[SYSTEM] Testando conexão com o PostGIS...", flush=True)
+    print("[SYSTEM] Testando conexao com o PostGIS...", flush=True)
     try:
         conn = obter_conexao()
         cursor = conn.cursor()
         cursor.execute("SELECT version();")
         db_version = cursor.fetchone()
-        print(f"[SYSTEM] Conexão bem-sucedida! Versão: {db_version[0][:40]}", flush=True)
+        print(f"[SYSTEM] Conexao bem-sucedida! Versao: {db_version[0][:40]}", flush=True)
         cursor.close()
+
+        diag = diagnostico_completo(conn)
+        total_fila = (diag['pendentes'] + diag['pendentes_ia'] + diag['processando']
+                      + diag['erros'] + diag['rejeitados_ia'])
+
+        print("[SYSTEM] === Saude da fila ===", flush=True)
+        print(f"[SYSTEM] Anuncios validos (extraidos): {diag['validos']}", flush=True)
+        print(f"[SYSTEM] Total na fila (todos os status): {total_fila}", flush=True)
+        print(f"[SYSTEM] Pendentes (fila normal): {diag['pendentes']}", flush=True)
+        print(f"[SYSTEM] Pendentes IA (so GPU): {diag['pendentes_ia']}", flush=True)
+        print(f"[SYSTEM] Processando agora: {diag['processando']}", flush=True)
+        print(f"[SYSTEM] Com erro (aguarda ACI): {diag['erros']}", flush=True)
+        print(f"[SYSTEM] Rejeitados pela IA: {diag['rejeitados_ia']}", flush=True)
+
+        print("[SYSTEM] === Qualidade dos anuncios validos ===", flush=True)
+        print(f"[SYSTEM] Sem area (hectare): {diag['sem_area']}", flush=True)
+        print(f"[SYSTEM] Sem valor total: {diag['sem_valor']}", flush=True)
+        print(f"[SYSTEM] Sem municipio mapeado: {diag['sem_municipio']}", flush=True)
+
+        print("[SYSTEM] === Cobertura geografica ===", flush=True)
+        if diag['municipios_totais'] > 0:
+            pct = 100.0 * diag['municipios_com_dados'] / diag['municipios_totais']
+            print(f"[SYSTEM] Municipios com dados: {diag['municipios_com_dados']} de "
+                  f"{diag['municipios_totais']} ({pct:.1f}%)", flush=True)
+        else:
+            print(f"[SYSTEM] Municipios com dados: {diag['municipios_com_dados']}", flush=True)
+
+        if diag['top_uf']:
+            print("[SYSTEM] === Top 5 UFs por volume ===", flush=True)
+            for uf, n in diag['top_uf']:
+                print(f"[SYSTEM] {uf}: {n} anuncios", flush=True)
+
+        if diag['top_erros']:
+            print("[SYSTEM] === Top 5 motivos de erro ===", flush=True)
+            for motivo, n in diag['top_erros']:
+                print(f"[SYSTEM] {motivo}: {n}", flush=True)
+
+        if diag['top_mun_erro']:
+            print("[SYSTEM] === Top 5 municipios com mais erros ===", flush=True)
+            for lugar, n in diag['top_mun_erro']:
+                print(f"[SYSTEM] {lugar}: {n}", flush=True)
+
         conn.close()
     except Exception as e:
-        print(f"[SYSTEM] Falha na conexão: {e}", flush=True)
+        print(f"[SYSTEM] Falha na conexao: {e}", flush=True)
 
 def iniciar_pipeline_v2(num_workers):
     tarefas = obter_tarefas_ativas()
@@ -56,6 +99,8 @@ def iniciar_pipeline_v2(num_workers):
     print("[SYSTEM] Operação FULL Concluída!", flush=True)
 
 def executar_tarefa(tarefa_id, num_workers=1, limite=0):
+    # Limpa qualquer flag de parada que tenha sobrado de uma execucao anterior
+    limpar_parada()
     if tarefa_id == "1" or tarefa_id == "lfp":
         tarefas = obter_tarefas_ativas()
         executar_lfp(tarefas)
@@ -70,7 +115,9 @@ def executar_tarefa(tarefa_id, num_workers=1, limite=0):
         for w in workers_list: w.join()
             
     elif tarefa_id == "3" or tarefa_id == "aci":
-        limit_val = limite if limite > 0 else 50
+        # limite=0 (default) -> processa TODA a fila de erros.
+        # Passe --limit N para capar manualmente.
+        limit_val = limite if limite > 0 else None
         executar_aci_separado(limite=limit_val)
         
     elif tarefa_id == "4" or tarefa_id == "full":

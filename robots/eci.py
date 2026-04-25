@@ -33,6 +33,7 @@ from database.engine import (
     detectar_isca, extrair_valor_total_regex,
 )
 from robots.capacidade import detectar_modo
+from robots._controle import foi_solicitado_parar
 
 try:
     from playwright_stealth import stealth_sync
@@ -381,9 +382,12 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
 
         while True:
             if limite_isolado and processados >= limite_isolado: break
+            if foi_solicitado_parar():
+                print(f"Worker {worker_id}: [SYSTEM] Parando após o anúncio atual...", flush=True)
+                break
 
             conn = obter_conexao()
-            tarefa = obter_tarefa_da_fila(conn)
+            tarefa = obter_tarefa_da_fila(conn, modo_ia=(modo == "ia"))
             conn.close()
 
             if not tarefa:
@@ -394,7 +398,9 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                 time.sleep(5); continue
 
             esperando_log = False
-            fil_id, fonte, url = tarefa
+            fil_id, fonte, url, era_ia = tarefa
+            if era_ia:
+                print(f"Worker {worker_id}: [INFO] Tarefa vinda de PENDENTE_IA", flush=True)
             salvou_neste_ciclo = False
             print(f"\n{'-'*60}")
             print(f"Worker {worker_id}: [PROCESSANDO] ID {fil_id} | {url}", flush=True)
@@ -422,7 +428,7 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                 if dados.get('adNotFound'):
                     conn_s = obter_conexao()
                     try:
-                        finalizar_tarefa(conn_s, fil_id, 'ERRO', "LINK_INATIVO: Anuncio removido")
+                        finalizar_tarefa(conn_s, fil_id, 'ERRO', "LINK_INATIVO: Anuncio removido", origem_ia=era_ia)
                         print(f"Worker {worker_id}: [LINK MORTO] ID {fil_id}", flush=True)
                     finally:
                         conn_s.close()
@@ -444,7 +450,7 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                 if len(texto_pag) < 100:
                     conn_s = obter_conexao()
                     try:
-                        finalizar_tarefa(conn_s, fil_id, 'ERRO', "DESCARTADO: pagina_sem_conteudo")
+                        finalizar_tarefa(conn_s, fil_id, 'ERRO', "DESCARTADO: pagina_sem_conteudo", origem_ia=era_ia)
                         print(f"Worker {worker_id}: [VAZIO] ID {fil_id} -> pagina sem texto", flush=True)
                     finally:
                         conn_s.close()
@@ -567,7 +573,8 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                     conn_s = obter_conexao()
                     try:
                         finalizar_tarefa(conn_s, fil_id, 'ERRO',
-                                          f"DESCARTADO: confianca_baixa({conf_final}) | {extrato.raciocinio[:100]}")
+                                          f"DESCARTADO: confianca_baixa({conf_final}) | {extrato.raciocinio[:100]}",
+                                          origem_ia=era_ia)
                         print(f"Worker {worker_id}: [CONFIANCA BAIXA] ID {fil_id} ({conf_final}) -> {extrato.raciocinio[:80]}", flush=True)
                     finally:
                         conn_s.close()
@@ -578,7 +585,7 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                 if not ok:
                     conn_s = obter_conexao()
                     try:
-                        finalizar_tarefa(conn_s, fil_id, 'ERRO', f"DESCARTADO: {motivo}")
+                        finalizar_tarefa(conn_s, fil_id, 'ERRO', f"DESCARTADO: {motivo}", origem_ia=era_ia)
                         print(f"Worker {worker_id}: [IMPLAUSIVEL] ID {fil_id} -> {motivo}", flush=True)
                     finally:
                         conn_s.close()
@@ -596,7 +603,8 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                         print(f"Worker {worker_id}: [MUN VIA SLUG] IA={municipio} -> URL={municipio_final}", flush=True)
                     if not mun_id_db:
                         finalizar_tarefa(conn_s, fil_id, 'ERRO',
-                                          f"Municipio nao encontrado: {municipio}/{uf}")
+                                          f"Municipio nao encontrado: {municipio}/{uf}",
+                                          origem_ia=era_ia)
                         print(f"Worker {worker_id}: [MUN NAO ENCONTRADO] ID {fil_id} -> {municipio}/{uf}", flush=True)
                     else:
                         print(f"Worker {worker_id}: [SALVANDO] ID {fil_id} | {municipio_final}/{uf}", flush=True)
@@ -627,7 +635,7 @@ def executar_eci_worker(worker_id=1, evento_lfp_fim=None, limite_isolado=None):
                 print(f"Worker {worker_id}: [ERRO CRITICO] ID {fil_id} - {str(e)[:120]}", flush=True)
                 try:
                     conn_e = obter_conexao()
-                    finalizar_tarefa(conn_e, fil_id, 'ERRO', str(e)[:60])
+                    finalizar_tarefa(conn_e, fil_id, 'ERRO', str(e)[:60], origem_ia=era_ia)
                     conn_e.close()
                 except Exception:
                     pass

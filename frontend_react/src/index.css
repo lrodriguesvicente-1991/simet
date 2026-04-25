@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* =====================================================================
+   Tokens de tema (claro)
+   ===================================================================== */
 @theme {
   --color-primary: #005826;
   --color-primary-foreground: #FFFFFF;
@@ -17,4 +20,71 @@
 body {
   background-color: var(--color-background);
   color: var(--color-foreground);
+}
+
+/* =====================================================================
+   Dark mode automático (segue prefers-color-scheme do navegador)
+   =====================================================================
+   Troca os tokens semânticos e remapeia os utilitários Tailwind mais
+   comuns (bg-white, bg-slate-*, text-slate-*) sem exigir alteracao nos
+   componentes. color-scheme: dark avisa o navegador pra renderizar
+   scrollbars, autofill, selects etc. no tema escuro.
+*/
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-background: #0b1120;
+    --color-foreground: #e5e7eb;
+    --color-card: #111827;
+    --color-border: #1f2937;
+    --color-muted: #1e293b;
+    --color-muted-foreground: #94a3b8;
+    --color-accent: #064e3b;
+    --color-accent-foreground: #86efac;
+    --color-primary: #16a34a;
+    --color-primary-foreground: #052e16;
+  }
+
+  html, body {
+    color-scheme: dark;
+  }
+
+  /* Reajuste de utilitarios hardcoded no dark */
+  .bg-white { background-color: #111827 !important; }
+  .bg-slate-50 { background-color: #0f172a !important; }
+  .bg-slate-100 { background-color: #1e293b !important; }
+  .bg-slate-200 { background-color: #334155 !important; }
+  .bg-slate-300 { background-color: #475569 !important; }
+
+  .text-slate-400 { color: #94a3b8 !important; }
+  .text-slate-500 { color: #cbd5e1 !important; }
+  .text-slate-600 { color: #e2e8f0 !important; }
+  .text-slate-700 { color: #f1f5f9 !important; }
+  .text-slate-800 { color: #f8fafc !important; }
+  .text-slate-900 { color: #f8fafc !important; }
+
+  .border-slate-200,
+  .border-slate-300 { border-color: #1f2937 !important; }
+
+  /* Cores de foco/hover suaves que usam preto puro no claro */
+  .hover\:bg-slate-50:hover { background-color: #1e293b !important; }
+  .hover\:bg-muted\/50:hover { background-color: rgba(30, 41, 59, 0.6) !important; }
+
+  /* Cartoes com backgrounds semi-transparentes nos toasts/banners */
+  .bg-red-50 { background-color: #450a0a !important; }
+  .bg-amber-50 { background-color: #451a03 !important; }
+  .bg-emerald-50 { background-color: #052e16 !important; }
+  .bg-sky-50 { background-color: #082f49 !important; }
+  .bg-violet-50 { background-color: #2e1065 !important; }
+  .bg-indigo-50 { background-color: #1e1b4b !important; }
+  .bg-orange-50 { background-color: #431407 !important; }
+
+  /* Divisores */
+  .divide-border\/60 > :not([hidden]) ~ :not([hidden]) {
+    border-color: rgba(31, 41, 55, 0.6) !important;
+  }
+
+  /* Inputs nativos (select/input) ficam legiveis */
+  input, select, textarea, button {
+    color-scheme: dark;
+  }
 }

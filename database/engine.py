@@ -156,24 +156,68 @@ def salvar_na_fila(conn, fonte, url, dados_json=None):
     return inserido
 
 # --- OPERAÇÕES ECI (Extração) ---
-def obter_tarefa_da_fila(conn):
+def obter_tarefa_da_fila(conn, modo_ia=False):
+    """Puxa a proxima tarefa da fila.
+
+    modo_ia=True  -> prioriza PENDENTE_IA (exclusivo de GPU), cai em PENDENTE
+    modo_ia=False -> ignora PENDENTE_IA (so processa quando houver GPU)
+
+    Retorna (fil_id, fil_fonte, fil_url, era_ia) ou None. era_ia=True indica
+    que a tarefa veio da fila exclusiva de IA, usado ao finalizar p/ marcar
+    REJEITADO_IA em caso de falha.
+    """
     cursor = conn.cursor()
+    if modo_ia:
+        cursor.execute("""
+            UPDATE public.smt_fila_processamento
+            SET fil_status = 'PROCESSANDO', fil_data_atualizacao = CURRENT_TIMESTAMP
+            WHERE fil_id = (
+                SELECT fil_id FROM public.smt_fila_processamento
+                WHERE fil_status = 'PENDENTE_IA'
+                ORDER BY fil_id DESC LIMIT 1 FOR UPDATE SKIP LOCKED
+            )
+            RETURNING fil_id, fil_fonte, fil_url, TRUE AS era_ia;
+        """)
+        t = cursor.fetchone()
+        if t:
+            conn.commit()
+            cursor.close()
+            return t
+
     cursor.execute("""
         UPDATE public.smt_fila_processamento
         SET fil_status = 'PROCESSANDO', fil_data_atualizacao = CURRENT_TIMESTAMP
-        WHERE fil_id = (SELECT fil_id FROM public.smt_fila_processamento WHERE fil_status = 'PENDENTE' ORDER BY fil_id DESC LIMIT 1 FOR UPDATE SKIP LOCKED)
-        RETURNING fil_id, fil_fonte, fil_url;
+        WHERE fil_id = (
+            SELECT fil_id FROM public.smt_fila_processamento
+            WHERE fil_status = 'PENDENTE'
+            ORDER BY fil_id DESC LIMIT 1 FOR UPDATE SKIP LOCKED
+        )
+        RETURNING fil_id, fil_fonte, fil_url, FALSE AS era_ia;
     """)
     t = cursor.fetchone()
     conn.commit()
     cursor.close()
     return t
 
-def finalizar_tarefa(conn, fil_id, status, erro=None):
+def finalizar_tarefa(conn, fil_id, status, erro=None, origem_ia=False):
+    """Registra o status final de uma tarefa.
+
+    Se origem_ia=True e status='ERRO', promove para REJEITADO_IA -- a tarefa
+    ja passou pela fila exclusiva de IA e falhou de novo, entao so humano
+    reclassifica. O ACI NAO deve auditar REJEITADO_IA.
+    """
+    if origem_ia and status == 'ERRO':
+        status = 'REJEITADO_IA'
     cursor = conn.cursor()
-    cursor.execute("UPDATE public.smt_fila_processamento SET fil_status = %s, fil_data_atualizacao = CURRENT_TIMESTAMP WHERE fil_id = %s", (status, fil_id))
+    cursor.execute(
+        "UPDATE public.smt_fila_processamento SET fil_status = %s, fil_data_atualizacao = CURRENT_TIMESTAMP WHERE fil_id = %s",
+        (status, fil_id),
+    )
     if erro:
-        cursor.execute("INSERT INTO public.smt_anuncio_erro (err_fil_id, err_motivo) VALUES (%s, %s)", (fil_id, erro))
+        cursor.execute(
+            "INSERT INTO public.smt_anuncio_erro (err_fil_id, err_motivo) VALUES (%s, %s)",
+            (fil_id, erro),
+        )
     conn.commit()
     cursor.close()
 
@@ -247,30 +291,173 @@ def classificar_tipologias(conn, texto, threshold=5):
     return [tip_id for tip_id, score in scores.items() if score >= threshold]
 
 # --- OPERAÇÕES ACI NOVO (Auditoria) ---
-def obter_erros_para_auditoria(conn, limite=50):
+def obter_erros_para_auditoria(conn, limite=None):
+    """Retorna a lista de erros pendentes de auditoria.
+    limite=None ou <=0 -> sem limite (auditar toda a fila de erros)."""
     cursor = conn.cursor()
-    cursor.execute("""
+    base = """
         SELECT e.err_id, f.fil_id, f.fil_url, e.err_motivo
         FROM public.smt_anuncio_erro e
         JOIN public.smt_fila_processamento f ON e.err_fil_id = f.fil_id
         WHERE f.fil_status = 'ERRO'
           AND e.err_motivo NOT LIKE 'LINK_INATIVO:%%'
           AND e.err_motivo NOT LIKE 'DESCARTADO:%%'
-        LIMIT %s
-    """, (limite,))
+    """
+    if limite and limite > 0:
+        cursor.execute(base + " LIMIT %s", (limite,))
+    else:
+        cursor.execute(base)
     res = cursor.fetchall()
     cursor.close()
     return res
 
-def aprovar_reciclagem(conn, err_id, fil_id):
+def aprovar_reciclagem(conn, err_id, fil_id, status_destino='PENDENTE'):
+    """Devolve a tarefa para a fila no status indicado e remove o erro.
+    status_destino: 'PENDENTE' (retry determinstico) ou 'PENDENTE_IA' (retry IA)."""
+    if status_destino not in ('PENDENTE', 'PENDENTE_IA'):
+        raise ValueError(f"status_destino invalido: {status_destino}")
     cursor = conn.cursor()
-    cursor.execute("UPDATE public.smt_fila_processamento SET fil_status = 'PENDENTE' WHERE fil_id = %s", (fil_id,))
+    cursor.execute(
+        "UPDATE public.smt_fila_processamento SET fil_status = %s WHERE fil_id = %s",
+        (status_destino, fil_id),
+    )
     cursor.execute("DELETE FROM public.smt_anuncio_erro WHERE err_id = %s", (err_id,))
     conn.commit()
     cursor.close()
+
+
+def rejeitar_ia_direto(conn, err_id, fil_id, motivo):
+    """Marca a tarefa como REJEITADO_IA sem passar pela fila novamente.
+    Mantem o registro em smt_anuncio_erro com o motivo atualizado."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE public.smt_fila_processamento SET fil_status = 'REJEITADO_IA', fil_data_atualizacao = CURRENT_TIMESTAMP WHERE fil_id = %s",
+        (fil_id,),
+    )
+    cursor.execute(
+        "UPDATE public.smt_anuncio_erro SET err_motivo = %s WHERE err_id = %s",
+        (f"REJEITADO_IA: {motivo}", err_id),
+    )
+    conn.commit()
+    cursor.close()
+
 
 def descartar_link_morto(conn, err_id, fil_id, motivo):
     cursor = conn.cursor()
     cursor.execute("UPDATE public.smt_anuncio_erro SET err_motivo = %s WHERE err_id = %s", (f"LINK_INATIVO: {motivo}", err_id))
     conn.commit()
     cursor.close()
+
+
+def contagem_saude_fila(conn):
+    """Retorna um dict com a contagem atual por status da fila + volume
+    acumulado de smt_anuncio (validos). Fonte do 'dashboard de saude'."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT fil_status, COUNT(*)::int AS total
+        FROM public.smt_fila_processamento
+        GROUP BY fil_status
+    """)
+    por_status = {linha[0]: linha[1] for linha in cursor.fetchall()}
+
+    cursor.execute("SELECT COUNT(*)::int FROM public.smt_anuncio")
+    total_anuncios = cursor.fetchone()[0]
+
+    cursor.close()
+    return {
+        "validos": total_anuncios,
+        "pendentes": por_status.get("PENDENTE", 0),
+        "pendentes_ia": por_status.get("PENDENTE_IA", 0),
+        "processando": por_status.get("PROCESSANDO", 0),
+        "erros": por_status.get("ERRO", 0),
+        "rejeitados_ia": por_status.get("REJEITADO_IA", 0),
+        "concluidos": por_status.get("CONCLUIDO", 0),
+    }
+
+
+def diagnostico_completo(conn):
+    """Snapshot detalhado da base para o Testar Conexao.
+    Inclui saude da fila, qualidade dos anuncios, cobertura geografica e
+    rankings (top UFs por volume + top motivos de erro)."""
+    saude = contagem_saude_fila(conn)
+    cur = conn.cursor()
+
+    # --- Qualidade dos anuncios (sem campos criticos) ---
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE anc_hectare IS NULL OR anc_hectare <= 0)::int      AS sem_area,
+            COUNT(*) FILTER (WHERE anc_valor_total IS NULL OR anc_valor_total <= 0)::int AS sem_valor,
+            COUNT(*) FILTER (WHERE anc_mun_id IS NULL)::int                            AS sem_municipio
+        FROM public.smt_anuncio
+    """)
+    sem_area, sem_valor, sem_municipio = cur.fetchone()
+
+    # --- Cobertura geografica ---
+    cur.execute("""
+        SELECT COUNT(DISTINCT anc_mun_id)::int
+        FROM public.smt_anuncio WHERE anc_mun_id IS NOT NULL
+    """)
+    municipios_com_dados = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*)::int FROM public.smt_municipio")
+    municipios_totais = cur.fetchone()[0]
+
+    # --- Top 5 UFs por volume de anuncios validos ---
+    cur.execute("""
+        SELECT uf.unf_sigla, COUNT(*)::int AS total
+        FROM public.smt_anuncio a
+        JOIN public.smt_municipio m ON a.anc_mun_id = m.mun_id
+        JOIN public.smt_unidade_federativa uf ON m.mun_unf_id = uf.unf_id
+        GROUP BY uf.unf_sigla
+        ORDER BY total DESC
+        LIMIT 5
+    """)
+    top_uf = cur.fetchall()
+
+    # --- Top 5 categorias de erro (agrupadas por prefixo do err_motivo) ---
+    cur.execute("""
+        SELECT
+            CASE
+                WHEN err_motivo LIKE 'LINK_INATIVO:%' THEN 'LINK_INATIVO'
+                WHEN err_motivo LIKE 'DESCARTADO:%'   THEN 'DESCARTADO'
+                WHEN err_motivo LIKE 'REJEITADO_IA:%' THEN 'REJEITADO_IA'
+                WHEN err_motivo LIKE 'MUN_AUSENTE:%'  THEN 'MUN_AUSENTE'
+                ELSE COALESCE(SPLIT_PART(err_motivo, ':', 1), 'OUTRO')
+            END AS categoria,
+            COUNT(*)::int AS total
+        FROM public.smt_anuncio_erro
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 5
+    """)
+    top_erros = cur.fetchall()
+
+    # --- Top 5 municipios com mais anuncios em erro ---
+    cur.execute("""
+        SELECT
+            COALESCE(m.mun_nome || '/' || uf.unf_sigla, '(sem municipio mapeado)') AS lugar,
+            COUNT(*)::int AS total
+        FROM public.smt_anuncio_erro e
+        JOIN public.smt_fila_processamento f ON e.err_fil_id = f.fil_id
+        LEFT JOIN public.smt_anuncio a ON a.anc_fil_id = f.fil_id
+        LEFT JOIN public.smt_municipio m ON a.anc_mun_id = m.mun_id
+        LEFT JOIN public.smt_unidade_federativa uf ON m.mun_unf_id = uf.unf_id
+        WHERE f.fil_status = 'ERRO'
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 5
+    """)
+    top_mun_erro = cur.fetchall()
+
+    cur.close()
+
+    return {
+        **saude,
+        "sem_area": sem_area,
+        "sem_valor": sem_valor,
+        "sem_municipio": sem_municipio,
+        "municipios_com_dados": municipios_com_dados,
+        "municipios_totais": municipios_totais,
+        "top_uf": [(uf, n) for uf, n in top_uf],
+        "top_erros": [(motivo, n) for motivo, n in top_erros],
+        "top_mun_erro": [(lugar, n) for lugar, n in top_mun_erro],
+    }

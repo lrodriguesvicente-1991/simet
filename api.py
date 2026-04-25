@@ -7,23 +7,28 @@ import io
 import json
 import os
 import sys
+import time
 from collections import deque
 import psutil
 import subprocess
 import threading
 import jwt
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import pandas as pd
 from openpyxl.utils import get_column_letter
 from dotenv import load_dotenv
 
 from database.connection import obter_conexao
+from database.engine import contagem_saude_fila
 from database import usuarios as usuarios_db
+from robots._controle import limpar_parada, marcar_parada
 
 load_dotenv()
 
@@ -41,6 +46,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# GZip reduz payload JSON do /api/dados em ~10x (texto numerico repetitivo)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # =====================================================================
 # SISTEMA DE AUTENTICAÇÃO JWT (Seguro e via .ENV)
@@ -111,6 +119,7 @@ estado_robo = {
     "logs": deque(maxlen=500),
     "circuit_breaker": False,
     "circuit_breaker_msg": None,
+    "parando": False,  # True entre o pedido gracioso e o termino dos workers
 }
 
 def ler_logs_robo(proc):
@@ -157,9 +166,11 @@ def iniciar_robo(req: RoboRequest, user: dict = Depends(exigir_nivel(1))):
         
         estado_robo["rodando"] = True
         estado_robo["processo"] = processo
-        estado_robo["logs"] = deque([f"[SYSTEM] Iniciando operação: {req.task.upper()}..."], maxlen=500)
+        estado_robo["logs"] = deque([f"[SYSTEM] Iniciando: {req.task.upper()}..."], maxlen=500)
         estado_robo["circuit_breaker"] = False
         estado_robo["circuit_breaker_msg"] = None
+        estado_robo["parando"] = False
+        limpar_parada()
         
         # Dispara a thread para não bloquear o pipe!
         t = threading.Thread(target=ler_logs_robo, args=(processo,), daemon=True)
@@ -170,25 +181,32 @@ def iniciar_robo(req: RoboRequest, user: dict = Depends(exigir_nivel(1))):
         raise HTTPException(status_code=500, detail=f"Erro ao iniciar robô: {e}")
 
 @app.post("/api/robo/parar")
-def parar_robo(user: dict = Depends(exigir_nivel(1))):
+def parar_robo(force: bool = False, user: dict = Depends(exigir_nivel(1))):
+    """Parada graciosa por padrao: sinaliza aos workers para encerrarem apos
+    o anuncio atual. force=true mata a arvore de processos na hora (fallback)."""
     if not estado_robo["rodando"] or not estado_robo["processo"]:
-        return {"sucesso": False, "mensagem": "Nenhum robô rodando no momento."}
+        return {"sucesso": False, "mensagem": "Nenhum robo rodando no momento."}
 
+    if not force:
+        marcar_parada()
+        estado_robo["parando"] = True
+        estado_robo["logs"].append("[SYSTEM] Parando — aguardando os robôs terminarem o anúncio atual...")
+        return {"sucesso": True, "mensagem": "Parando...", "parando": True}
+
+    # force=True -> taskkill imediato (mantem o comportamento antigo como fallback)
     pid = estado_robo["processo"].pid
     mortos = 0
 
-    # No Windows, taskkill /F /T mata a árvore inteira (inclusive Chromium do Playwright)
     if sys.platform == "win32":
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=10, check=False
+                capture_output=True, timeout=10, check=False,
             )
             mortos = 1
         except Exception as e:
             estado_robo["logs"].append(f"[SYSTEM] taskkill falhou: {e}")
 
-    # Fallback universal via psutil (caso taskkill falhe ou estejamos em Linux/Mac)
     try:
         parent = psutil.Process(pid)
         filhos = parent.children(recursive=True)
@@ -200,24 +218,31 @@ def parar_robo(user: dict = Depends(exigir_nivel(1))):
         psutil.wait_procs([parent] + filhos, timeout=3)
         mortos = 1
     except psutil.NoSuchProcess:
-        mortos = 1  # Já morreu — sucesso
+        mortos = 1
     except Exception as e:
         estado_robo["logs"].append(f"[SYSTEM] psutil falhou: {e}")
 
     estado_robo["rodando"] = False
     estado_robo["processo"] = None
-    estado_robo["logs"].append("[SYSTEM] Operação abortada pelo usuário.")
+    estado_robo["parando"] = False
+    limpar_parada()
+    estado_robo["logs"].append("[SYSTEM] Operação interrompida pelo usuário.")
 
-    return {"sucesso": bool(mortos), "mensagem": "Robôs parados com sucesso!" if mortos else "Falha ao matar processo."}
+    return {"sucesso": bool(mortos), "mensagem": "Robos parados a forca." if mortos else "Falha ao matar processo."}
 
 @app.get("/api/robo/status")
 def status_robo(user: dict = Depends(exigir_nivel(2))):
-    # Checagem de vida: O processo morreu naturalmente (terminou o limite)?
+    # Checagem de vida: O processo morreu naturalmente (terminou o limite ou parada graciosa)?
     if estado_robo["rodando"] and estado_robo["processo"]:
-        if estado_robo["processo"].poll() is not None: # != None significa que acabou
+        if estado_robo["processo"].poll() is not None:
             estado_robo["rodando"] = False
             estado_robo["processo"] = None
-            estado_robo["logs"].append("[SYSTEM] Processo finalizado naturalmente.")
+            if estado_robo["parando"]:
+                estado_robo["logs"].append("[SYSTEM] Operação encerrada.")
+                estado_robo["parando"] = False
+            else:
+                estado_robo["logs"].append("[SYSTEM] Operação concluída.")
+            limpar_parada()
 
     logs = estado_robo["logs"]
     ultimas = list(logs)[-50:] if logs else []
@@ -226,6 +251,7 @@ def status_robo(user: dict = Depends(exigir_nivel(2))):
         "logs_recentes": ultimas,
         "circuit_breaker": estado_robo["circuit_breaker"],
         "circuit_breaker_msg": estado_robo["circuit_breaker_msg"],
+        "parando": estado_robo["parando"],
     }
 
 @app.post("/api/robo/reconhecer-alarme")
@@ -238,35 +264,94 @@ def reconhecer_alarme(user: dict = Depends(exigir_nivel(1))):
 # =====================================================================
 # ROTAS DE DASHBOARD (Requerem Token)
 # =====================================================================
+# Cache in-memory do payload do Observatorio. Invalida em /api/sincronizar.
+# A view nao muda fora dos refreshes da matview, entao 10min e seguro.
+_DADOS_CACHE: dict = {"timestamp": 0.0, "payload": None}
+_DADOS_TTL_S = 600
+
+_QUERY_DADOS = """
+SELECT
+    m.mun_nome AS municipio,
+    uf.unf_sigla AS estado,
+    CASE uf.unf_reg_id
+        WHEN 1 THEN 'Norte' WHEN 2 THEN 'Nordeste'
+        WHEN 3 THEN 'Sudeste' WHEN 4 THEN 'Sul'
+        WHEN 5 THEN 'Centro-Oeste' ELSE 'Desconhecida'
+    END AS regiao,
+    calc.categoria_tamanho, calc.total_anuncios_reais,
+    calc.mediana_geral, calc.mediana_agricola, calc.mediana_pecuaria,
+    calc.mediana_floresta_plantada, calc.mediana_floresta_nativa,
+    calc.n_agricola, calc.n_pecuaria, calc.n_floresta_plantada, calc.n_floresta_nativa,
+    calc.media_geral, calc.media_agricola, calc.media_pecuaria,
+    calc.media_floresta_plantada, calc.media_floresta_nativa,
+    calc.desvio_padrao, calc.coef_dispersao_pct,
+    mr.mre_codigo AS mercado_regional_codigo,
+    mr.mre_nome   AS mercado_regional_nome,
+    c.lat, c.lon
+FROM public.mv_estatisticas_simet calc
+JOIN public.smt_municipio m ON calc.anc_mun_id = m.mun_id
+JOIN public.smt_unidade_federativa uf ON m.mun_unf_id = uf.unf_id
+JOIN public.mv_centroide_municipio c ON c.mun_cod = m.mun_cod
+LEFT JOIN public.smt_mercado_regional mr ON mr.mre_id = m.mun_mre_id
+"""
+
+
+def _invalidar_cache_dados() -> None:
+    _DADOS_CACHE["timestamp"] = 0.0
+    _DADOS_CACHE["payload"] = None
+
+
+def _carregar_dados_observatorio() -> dict:
+    """Executa a query e devolve o payload pronto para serializacao.
+    Usa cursor direto (sem pandas) — em payloads grandes economiza ~1-2s
+    de overhead de DataFrame -> dict."""
+    t0 = time.time()
+    conn = obter_conexao()
+    try:
+        cur = conn.cursor()
+        cur.execute(_QUERY_DADOS)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+    finally:
+        conn.close()
+    t_query = time.time() - t0
+
+    # Conversao manual: list[dict] com floats nativos. Mais rapido que
+    # pandas.to_dict() em conjuntos de >5k linhas.
+    dados = [dict(zip(cols, row)) for row in rows]
+    payload = {"sucesso": True, "dados": dados}
+
+    _DADOS_CACHE["payload"] = payload
+    _DADOS_CACHE["timestamp"] = time.time()
+    print(f"[DADOS] cache aquecido: {len(dados)} linhas, query {t_query:.2f}s, total {time.time()-t0:.2f}s", flush=True)
+    return payload
+
+
+def _preaquecer_cache_em_thread() -> None:
+    def _alvo():
+        try:
+            _carregar_dados_observatorio()
+        except Exception as e:
+            print(f"[DADOS] pre-aquecimento falhou: {e}", flush=True)
+    threading.Thread(target=_alvo, daemon=True).start()
+
+
+@app.on_event("startup")
+def _on_startup_preaquecer():
+    """Dispara o carregamento do payload em background no boot da API,
+    pra primeira chamada do Observatorio ja vir do cache."""
+    _preaquecer_cache_em_thread()
+
+
 @app.get("/api/dados")
 def get_dashboard_data(user: dict = Depends(verificar_token)):
     """Busca os dados mastigados da View e converte para JSON para o React."""
+    agora = time.time()
+    if _DADOS_CACHE["payload"] is not None and (agora - _DADOS_CACHE["timestamp"]) < _DADOS_TTL_S:
+        return _DADOS_CACHE["payload"]
     try:
-        conn = obter_conexao()
-        query = """
-        SELECT
-            v.municipio, v.estado, v.regiao, v.categoria_tamanho, v.total_anuncios_reais,
-            v.mediana_geral, v.mediana_agricola, v.mediana_pecuaria,
-            v.mediana_floresta_plantada, v.mediana_floresta_nativa,
-            v.n_agricola, v.n_pecuaria, v.n_floresta_plantada, v.n_floresta_nativa,
-            v.media_geral, v.media_agricola, v.media_pecuaria,
-            v.media_floresta_plantada, v.media_floresta_nativa,
-            v.desvio_padrao, v.coef_dispersao_pct,
-            mr.mre_codigo AS mercado_regional_codigo,
-            mr.mre_nome   AS mercado_regional_nome,
-            ST_Y(ST_Centroid(v.geom_municipio::geometry)) AS lat,
-            ST_X(ST_Centroid(v.geom_municipio::geometry)) AS lon
-        FROM public.vw_media_mercado_terras v
-        LEFT JOIN public.smt_unidade_federativa u ON u.unf_sigla = v.estado
-        LEFT JOIN public.smt_municipio m
-               ON m.mun_nome = v.municipio AND m.mun_unf_id = u.unf_id
-        LEFT JOIN public.smt_mercado_regional mr ON mr.mre_id = m.mun_mre_id
-        WHERE v.geom_municipio IS NOT NULL
-        """
-        df = pd.read_sql(query, conn)
-        conn.close()
-        df = df.replace({pd.NA: None, float('nan'): None})
-        return {"sucesso": True, "dados": df.to_dict(orient="records")}
+        return _carregar_dados_observatorio()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -343,14 +428,23 @@ def get_geom(tipo: str, nome: str | None = None, uf: str | None = None,
 
 @app.post("/api/sincronizar")
 def sincronizar_view(user: dict = Depends(exigir_nivel(1))):
-    """Atualiza a Materialized View com novos cálculos matemáticos"""
+    """Atualiza as Materialized Views (estatisticas + centroides)."""
     try:
         conn = obter_conexao()
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY public.mv_estatisticas_simet;")
+        cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY public.mv_centroide_municipio;")
         cur.close()
         conn.close()
+        _invalidar_cache_dados()
+        # Reaquecimento sincrono: a proxima chamada do front a /api/dados ja
+        # encontra o cache fresco, evitando que o usuario espere a query de
+        # novo apos o sincronizar.
+        try:
+            _carregar_dados_observatorio()
+        except Exception as e:
+            print(f"[SINCRONIZAR] reaquecimento falhou: {e}", flush=True)
         return {"sucesso": True, "mensagem": "Base de dados sincronizada com sucesso!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -599,6 +693,343 @@ def exportar_pdf(estado: str, categoria: str | None = None,
 
 
 # =====================================================================
+# RELATORIO DE GRANDES PROPRIEDADES (Layout INCRA/UFF — fazendas >= 50 ha)
+# =====================================================================
+_COLUNAS_GRANDES = [
+    "Região", "Mercado Regional de Terras", "UF", "COD. IBGE", "Município",
+    "Mediana Geral", "Média Geral", "CV Geral",
+    "Mediana Agrícola", "Média Agrícola", "CV Agrícola",
+    "Mediana Pecuária", "Média Pecuária", "CV Pecuária",
+    "Mediana Floresta Plantada", "Média Floresta Plantada", "CV Floresta Plantada",
+    "Mediana Vegetação Nativa", "Média Vegetação Nativa", "CV Vegetação Nativa",
+]
+
+
+def _buscar_dados_grandes(regiao=None, estado=None, municipio=None, mercado_regional=None):
+    """Busca a matview de fazendas (>= 50 ha) no layout INCRA/UFF."""
+    wheres: list[str] = []
+    params: list = []
+    if regiao and regiao.lower() not in ("", "todas"):
+        wheres.append("v.regiao = %s"); params.append(regiao)
+    if estado and estado.lower() not in ("", "todos"):
+        wheres.append("v.uf = %s"); params.append(estado)
+    if municipio and municipio.lower() not in ("", "todos"):
+        wheres.append("v.municipio = %s"); params.append(municipio)
+    if mercado_regional and mercado_regional.lower() not in ("", "todos"):
+        wheres.append("mr.mre_codigo = %s"); params.append(mercado_regional)
+
+    where_sql = ("WHERE " + " AND ".join(wheres)) if wheres else ""
+
+    query = f"""
+    SELECT v.regiao,
+           v.mercado_regional,
+           v.uf,
+           v.mun_cod,
+           v.municipio,
+           v.mediana_geral, v.media_geral, v.coef_dispersao_geral,
+           v.mediana_agricola, v.media_agricola, v.coef_dispersao_agricola,
+           v.mediana_pecuaria, v.media_pecuaria, v.coef_dispersao_pecuaria,
+           v.mediana_floresta_plantada, v.media_floresta_plantada, v.coef_dispersao_floresta_plantada,
+           v.mediana_vegetacao_nativa, v.media_vegetacao_nativa, v.coef_dispersao_vegetacao_nativa
+    FROM public.mv_media_municipio_fazendas v
+    LEFT JOIN public.smt_unidade_federativa uf ON uf.unf_sigla = v.uf
+    LEFT JOIN public.smt_municipio m
+           ON m.mun_cod = v.mun_cod
+    LEFT JOIN public.smt_mercado_regional mr ON mr.mre_id = m.mun_mre_id
+    {where_sql}
+    ORDER BY v.regiao, v.uf, v.municipio
+    """
+
+    conn = obter_conexao()
+    try:
+        df = pd.read_sql(query, conn, params=params or None)
+    finally:
+        conn.close()
+    return df.replace({pd.NA: None, float('nan'): None})
+
+
+def _fmt_brl_num(v):
+    """Formata numero como '99.999.999,99' (sem prefixo R$)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    try:
+        return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return ""
+
+
+def _fmt_pct(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    try:
+        return f"{float(v):,.2f} %".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return ""
+
+
+@app.get("/api/relatorio/grandes-propriedades/xlsx")
+def exportar_grandes_xlsx(regiao: str | None = None, estado: str | None = None,
+                          municipio: str | None = None, mercado_regional: str | None = None,
+                          user: dict = Depends(verificar_token)):
+    """Relatorio de Grandes Propriedades (fazendas >= 50 ha) no layout INCRA/UFF."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter as _gcl
+
+        df = _buscar_dados_grandes(regiao, estado, municipio, mercado_regional)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Grandes Propriedades"
+
+        verde = PatternFill(start_color="3D6A1C", end_color="3D6A1C", fill_type="solid")
+        verde_claro = PatternFill(start_color="6FA030", end_color="6FA030", fill_type="solid")
+        branco_bold = Font(bold=True, color="FFFFFF", size=10)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin = Side(border_style="thin", color="DDDDDD")
+        borda = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        # Titulo
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(_COLUNAS_GRANDES))
+        cel = ws.cell(row=1, column=1, value="SIMET / INCRA — Dados de Ofertas WEB Grandes Propriedades R$/ha")
+        cel.font = Font(bold=True, color="FFFFFF", size=12)
+        cel.fill = verde
+        cel.alignment = center
+
+        # Subtitulo com data
+        ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(_COLUNAS_GRANDES))
+        cel = ws.cell(row=2, column=1,
+                      value=f"Data de Atualização: {datetime.now().strftime('%d/%m/%Y')}")
+        cel.font = Font(italic=True, size=9)
+        cel.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Cabecalho
+        for idx, nome in enumerate(_COLUNAS_GRANDES, start=1):
+            c = ws.cell(row=3, column=idx, value=nome)
+            c.font = branco_bold
+            c.fill = verde_claro
+            c.alignment = center
+            c.border = borda
+
+        # Dados
+        col_money = {6, 7, 9, 10, 12, 13, 15, 16, 18, 19}  # Mediana e Media de cada tipologia
+        col_pct = {8, 11, 14, 17, 20}                       # CV de cada tipologia
+        col_int = {4}                                       # COD. IBGE
+
+        for ridx, row in enumerate(df.itertuples(index=False), start=4):
+            for cidx, val in enumerate(row, start=1):
+                if cidx in col_money:
+                    cel = ws.cell(row=ridx, column=cidx, value=(float(val) if val is not None else None))
+                    cel.number_format = '#,##0.00'
+                elif cidx in col_pct:
+                    cel = ws.cell(row=ridx, column=cidx, value=(float(val) if val is not None else None))
+                    cel.number_format = '#,##0.00" %"'
+                elif cidx in col_int:
+                    cel = ws.cell(row=ridx, column=cidx, value=(int(val) if val is not None else None))
+                else:
+                    cel = ws.cell(row=ridx, column=cidx, value=val)
+                cel.border = borda
+                cel.alignment = Alignment(
+                    horizontal="right" if cidx in (col_money | col_pct | col_int) else "left",
+                    vertical="center",
+                )
+
+        ws.freeze_panes = "F4"  # congela ate Municipio + linha de header
+
+        larguras = [14, 26, 6, 12, 28] + [16, 16, 11] * 5
+        for i, w in enumerate(larguras, start=1):
+            ws.column_dimensions[_gcl(i)].width = w
+
+        ws.row_dimensions[1].height = 22
+        ws.row_dimensions[3].height = 32
+
+        buffer = io.BytesIO()
+        wb.save(buffer)
+        buffer.seek(0)
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        nome = f"simet_grandes_propriedades_{ts}.xlsx"
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{nome}"'},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/relatorio/grandes-propriedades/pdf")
+def exportar_grandes_pdf(estado: str, mercado_regional: str | None = None,
+                         regiao: str | None = None, municipio: str | None = None,
+                         user: dict = Depends(verificar_token)):
+    """Relatorio PDF de Grandes Propriedades (fazendas >= 50 ha) — exige UF."""
+    if not estado or estado.lower() == "todos":
+        raise HTTPException(status_code=400, detail="Parametro 'estado' (UF) e obrigatorio no PDF.")
+
+    try:
+        from reportlab.lib.pagesizes import A3, landscape
+        from reportlab.lib.colors import HexColor, black
+        from reportlab.pdfgen import canvas
+        from reportlab.platypus import Table, TableStyle
+        from reportlab.lib import colors as rl_colors
+
+        df = _buscar_dados_grandes(regiao=regiao, estado=estado,
+                                   municipio=municipio, mercado_regional=mercado_regional)
+
+        mercado_nome = ""
+        if mercado_regional and mercado_regional.lower() != "todos" and not df.empty:
+            nome_col = df["mercado_regional"].dropna()
+            if not nome_col.empty:
+                mercado_nome = str(nome_col.iloc[0])
+
+        buffer = io.BytesIO()
+        largura, altura = landscape(A3)
+        c = canvas.Canvas(buffer, pagesize=landscape(A3))
+
+        def cabecalho():
+            _desenhar_logo_incra(c, 36, altura - 72, tamanho=52)
+            c.setFillColor(HexColor("#3D6A1C"))
+            c.setFont("Helvetica-Bold", 17)
+            c.drawString(104, altura - 38, "SIMET / INCRA · Dados de Ofertas WEB Grandes Propriedades R$/ha")
+            c.setFillColor(black)
+            c.setFont("Helvetica", 10)
+            sub = f"UF: {estado}"
+            if mercado_nome:
+                sub += f" · Mercado Regional: {mercado_nome}"
+            sub += f" · Data de Atualização: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            c.drawString(104, altura - 58, sub)
+            c.setStrokeColor(HexColor("#6FA030"))
+            c.setLineWidth(1.5)
+            c.line(36, altura - 84, largura - 36, altura - 84)
+
+        def rodape(pagina, total):
+            c.setFont("Helvetica-Oblique", 8)
+            c.setFillColor(HexColor("#888888"))
+            c.drawString(36, 20, "SIMET · Sistema de Inteligencia de Mercado de Terras · INCRA")
+            c.drawRightString(largura - 36, 20, f"Pagina {pagina}/{total}")
+            c.setFillColor(black)
+
+        # Cabecalho hierarquico em 2 linhas
+        # Linha 0: dimensoes (5) + 5 grupos de tipologia (3 colunas cada)
+        super_header = ["Região", "Mercado Regional", "UF", "COD. IBGE", "Município",
+                        "Geral", "", "", "Agrícola", "", "",
+                        "Pecuária", "", "", "Floresta Plantada", "", "",
+                        "Vegetação Nativa", "", ""]
+        sub_header = ["", "", "", "", "",
+                      "Mediana", "Média", "CV", "Mediana", "Média", "CV",
+                      "Mediana", "Média", "CV", "Mediana", "Média", "CV",
+                      "Mediana", "Média", "CV"]
+
+        col_widths = [62, 100, 24, 50, 110,
+                      52, 52, 38, 52, 52, 38, 52, 52, 38, 52, 52, 38, 52, 52, 38]
+
+        if df.empty:
+            cabecalho()
+            c.setFont("Helvetica", 12)
+            c.drawString(40, altura - 120, "Nenhum dado encontrado para os filtros selecionados.")
+            rodape(1, 1)
+            c.save()
+        else:
+            linhas_dados = []
+            for _, r in df.iterrows():
+                linhas_dados.append([
+                    str(r.get("regiao") or ""),
+                    str(r.get("mercado_regional") or "—"),
+                    str(r.get("uf") or ""),
+                    str(int(r["mun_cod"])) if r.get("mun_cod") is not None else "",
+                    str(r.get("municipio") or ""),
+                    _fmt_brl_num(r.get("mediana_geral")),
+                    _fmt_brl_num(r.get("media_geral")),
+                    _fmt_pct(r.get("coef_dispersao_geral")),
+                    _fmt_brl_num(r.get("mediana_agricola")),
+                    _fmt_brl_num(r.get("media_agricola")),
+                    _fmt_pct(r.get("coef_dispersao_agricola")),
+                    _fmt_brl_num(r.get("mediana_pecuaria")),
+                    _fmt_brl_num(r.get("media_pecuaria")),
+                    _fmt_pct(r.get("coef_dispersao_pecuaria")),
+                    _fmt_brl_num(r.get("mediana_floresta_plantada")),
+                    _fmt_brl_num(r.get("media_floresta_plantada")),
+                    _fmt_pct(r.get("coef_dispersao_floresta_plantada")),
+                    _fmt_brl_num(r.get("mediana_vegetacao_nativa")),
+                    _fmt_brl_num(r.get("media_vegetacao_nativa")),
+                    _fmt_pct(r.get("coef_dispersao_vegetacao_nativa")),
+                ])
+
+            chunk = 28  # linhas por pagina
+            total_pags = max(1, (len(linhas_dados) + chunk - 1) // chunk)
+            for p in range(total_pags):
+                cabecalho()
+                inicio = p * chunk
+                fim = min(len(linhas_dados), inicio + chunk)
+                trecho = [super_header, sub_header] + linhas_dados[inicio:fim]
+                tbl = Table(trecho, colWidths=col_widths, repeatRows=2)
+                tbl.setStyle(TableStyle([
+                    # SPANs (precisam vir antes dos estilos das celulas mescladas)
+                    ("SPAN", (0, 0), (0, 1)),
+                    ("SPAN", (1, 0), (1, 1)),
+                    ("SPAN", (2, 0), (2, 1)),
+                    ("SPAN", (3, 0), (3, 1)),
+                    ("SPAN", (4, 0), (4, 1)),
+                    ("SPAN", (5, 0), (7, 0)),
+                    ("SPAN", (8, 0), (10, 0)),
+                    ("SPAN", (11, 0), (13, 0)),
+                    ("SPAN", (14, 0), (16, 0)),
+                    ("SPAN", (17, 0), (19, 0)),
+                    # Dimensoes (cols 0..4, ambas as linhas) — verde escuro nas 2 linhas
+                    ("BACKGROUND", (0, 0), (4, 1), HexColor("#3D6A1C")),
+                    ("TEXTCOLOR", (0, 0), (4, 1), rl_colors.white),
+                    ("FONTNAME", (0, 0), (4, 1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (4, 1), 8),
+                    ("ALIGN", (0, 0), (4, 1), "CENTER"),
+                    # Super-header das tipologias (cols 5..19, linha 0)
+                    ("BACKGROUND", (5, 0), (-1, 0), HexColor("#3D6A1C")),
+                    ("TEXTCOLOR", (5, 0), (-1, 0), rl_colors.white),
+                    ("FONTNAME", (5, 0), (-1, 0), "Helvetica-Bold"),
+                    ("FONTSIZE", (5, 0), (-1, 0), 8),
+                    ("ALIGN", (5, 0), (-1, 0), "CENTER"),
+                    # Sub-header das metricas (cols 5..19, linha 1)
+                    ("BACKGROUND", (5, 1), (-1, 1), HexColor("#6FA030")),
+                    ("TEXTCOLOR", (5, 1), (-1, 1), rl_colors.white),
+                    ("FONTNAME", (5, 1), (-1, 1), "Helvetica-Bold"),
+                    ("FONTSIZE", (5, 1), (-1, 1), 7),
+                    ("ALIGN", (5, 1), (-1, 1), "CENTER"),
+                    # Corpo
+                    ("FONTSIZE", (0, 2), (-1, -1), 6.5),
+                    ("ROWBACKGROUNDS", (0, 2), (-1, -1), [rl_colors.whitesmoke, rl_colors.white]),
+                    ("ALIGN", (2, 2), (2, -1), "CENTER"),     # UF
+                    ("ALIGN", (3, 2), (3, -1), "CENTER"),     # COD. IBGE
+                    ("ALIGN", (5, 2), (-1, -1), "RIGHT"),     # numericos
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                    ("TOPPADDING", (0, 0), (-1, 1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, 1), 6),
+                    ("TOPPADDING", (0, 2), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 2), (-1, -1), 2),
+                    ("GRID", (0, 0), (-1, -1), 0.25, HexColor("#CCCCCC")),
+                ]))
+                w, h = tbl.wrapOn(c, largura - 72, altura - 160)
+                tbl.drawOn(c, 36, altura - 100 - h)
+                rodape(p + 1, total_pags)
+                if p + 1 < total_pags:
+                    c.showPage()
+            c.save()
+
+        buffer.seek(0)
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        nome = f"simet_grandes_propriedades_{estado}_{ts}.pdf"
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{nome}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =====================================================================
 # GESTAO DE USUARIOS (nivel 0 apenas, exceto /me)
 # =====================================================================
 class NovoUsuarioReq(BaseModel):
@@ -617,6 +1048,18 @@ class ResetSenhaReq(BaseModel):
 @app.get("/api/me")
 def obter_perfil_atual(user: dict = Depends(verificar_token)):
     return {"usuario": user["username"], "nivel": user["nivel"], "id": user.get("id")}
+
+
+@app.get("/api/saude")
+def saude_base(user: dict = Depends(verificar_token)):
+    """Retorna o snapshot de saude da base (validos + contagens por status
+    da fila de processamento). Usado na Central de Comando para acompanhar
+    o backlog sem precisar executar uma operacao."""
+    conn = obter_conexao()
+    try:
+        return {"sucesso": True, **contagem_saude_fila(conn)}
+    finally:
+        conn.close()
 
 
 @app.get("/api/usuarios")
@@ -683,3 +1126,49 @@ def excluir_usuario(usr_id: int, user: dict = Depends(exigir_nivel(0))):
             )
     usuarios_db.excluir(usr_id)
     return {"sucesso": True}
+
+
+# =====================================================================
+# SERVIR O FRONTEND BUILDADO (modo "executavel")
+# =====================================================================
+# Quando frontend_react/dist/ existe (gerado por `npm run build`), o uvicorn
+# passa a servir o app inteiro num unico processo + porta. Sem o build, esse
+# bloco e no-op e o front segue rodando via `npm run dev` em outra porta.
+# IMPORTANTE: mount fica POR ULTIMO para nao sobrepor as rotas /api/*.
+_FRONT_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "frontend_react", "dist")
+
+if os.path.isdir(_FRONT_DIST):
+    # Assets versionados pelo Vite (hash no nome) — cache longo seguro
+    _ASSETS_DIR = os.path.join(_FRONT_DIST, "assets")
+    if os.path.isdir(_ASSETS_DIR):
+        app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
+
+    _INDEX_HTML = os.path.join(_FRONT_DIST, "index.html")
+
+    # index.html NAO pode cachear — quando o build muda os hashes dos bundles
+    # mudam, mas o navegador precisa pegar o index.html novo pra saber disso.
+    # Os bundles JS/CSS sao seguros pra cache longo (URL versionada).
+    _NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate"}
+
+    @app.get("/{caminho:path}", include_in_schema=False)
+    def _spa_catch_all(caminho: str, request: Request):
+        # Bloqueia rotas de API que nao casaram (404 explicito ao inves de
+        # devolver index.html, que confundiria fetches do front).
+        if caminho.startswith("api/") or caminho.startswith("api"):
+            raise HTTPException(status_code=404, detail="Endpoint nao encontrado")
+
+        # Tenta servir um arquivo estatico real (favicon, robots.txt, etc.)
+        candidato = os.path.join(_FRONT_DIST, caminho) if caminho else _INDEX_HTML
+        if caminho and os.path.isfile(candidato):
+            # index.html (caso raro de ser solicitado direto): no-cache
+            if caminho == "index.html":
+                return FileResponse(candidato, headers=_NO_CACHE)
+            return FileResponse(candidato)
+        # SPA fallback: qualquer outra rota devolve o index.html (sem cache)
+        return FileResponse(_INDEX_HTML, headers=_NO_CACHE)
+
+    print(f"[STATIC] Front buildado servido de {_FRONT_DIST}", flush=True)
+else:
+    print(f"[STATIC] {_FRONT_DIST} nao existe — front em modo dev (rode `npm run dev`)",
+          flush=True)
